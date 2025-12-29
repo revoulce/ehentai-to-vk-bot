@@ -1,0 +1,9 @@
+aiohttp
+SQLAlchemy
+aiosqlite
+pydantic
+pydantic-settings
+parsel
+loguru
+tenacity
+aiogram

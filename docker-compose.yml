@@ -1,0 +1,17 @@
+services:
+  vk-bot:
+    build: .
+    container_name: ehentai_vk_bot
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+      - ./downloads:/app/downloads
+    environment:
+      - DB_URL=sqlite+aiosqlite:///./data/bot.db
+    stop_grace_period: 30s
