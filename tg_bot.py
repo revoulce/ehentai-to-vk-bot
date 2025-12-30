@@ -1,141 +1,73 @@
-from datetime import datetime, timedelta, timezone
-from sqlalchemy import select, func
+import html
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message
+from aiogram.filters import Command, CommandStart
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
-from models import AsyncSessionLocal, Gallery, PostStatus
-from scraper import EhentaiHarvester
-from utils import process_tags
+from config import settings
+from services import queue_gallery, get_queue_status, ServiceError
 
-
-class ServiceError(Exception):
-    pass
-
-
-def generate_caption(gallery: Gallery) -> str:
-    """Constructs the VK post body from gallery metadata."""
-    tags_dict = gallery.tags
-    lines = [gallery.title, ""]
-
-    def add_group(label: str, key: str) -> None:
-        if key in tags_dict and tags_dict[key]:
-            processed = process_tags(tags_dict[key])
-            if processed:
-                lines.append(f"{label}: {' '.join(processed)}")
-
-    add_group("Фэндом", "parody")
-    add_group("Персонаж", "character")
-    add_group("Модель", "cosplayer")
-
-    lines.append("")
-    lines.append(f"Source: {gallery.source_url}")
-    return "\n".join(lines)
+router = Router()
+router.message.filter(F.from_user.id.in_(settings.ADMIN_IDS))
 
 
-async def get_next_available_slot(from_time: datetime | None = None) -> datetime:
-    """
-    Determines the next valid hourly slot for scheduling.
-    Ensures a minimum 5-minute buffer from the current time.
-    """
-    now_utc = datetime.now(timezone.utc)
-
-    async with AsyncSessionLocal() as session:
-        stmt = select(func.max(Gallery.scheduled_for))
-        last_db_time = (await session.execute(stmt)).scalar()
-
-        if last_db_time and last_db_time.tzinfo is None:
-            last_db_time = last_db_time.replace(tzinfo=timezone.utc)
-
-    # Determine baseline: either the requested time, the last scheduled post, or now
-    if from_time:
-        base_time = max(from_time, now_utc)
-    else:
-        base_time = max(last_db_time, now_utc) if last_db_time else now_utc
-
-    # Round up to the next full hour
-    next_hour = base_time.replace(minute=0, second=0, microsecond=0) + timedelta(
-        hours=1
+@router.message(CommandStart())
+async def cmd_start(message: Message) -> None:
+    await message.answer(
+        "<b>E-Hentai Manager</b>\n\n"
+        "/add &lt;url&gt; [url2] ... - Queue galleries\n"
+        "/status - Check queue"
     )
 
-    # VK API requires publish_date to be strictly in the future
-    if (next_hour - now_utc).total_seconds() < 300:
-        next_hour += timedelta(hours=1)
 
-    return next_hour
-
-
-async def queue_gallery(url: str) -> str:
-    """
-    Fast-path: inserts a placeholder record into the DB.
-    Actual processing happens in the background downloader loop.
-    """
-    async with AsyncSessionLocal() as session:
-        stmt = select(Gallery).where(Gallery.source_url == url)
-        if (await session.execute(stmt)).scalar():
-            raise ServiceError("Gallery already exists")
-
-        new_gallery = Gallery(
-            source_url=url,
-            title="Pending Download...",
-            tags=[],
-            local_images=[],
-            status=PostStatus.PENDING,
-            # Placeholder time, updated after download
-            scheduled_for=datetime.now(timezone.utc),
-        )
-        session.add(new_gallery)
-        await session.commit()
-
-    return "Queued"
+@router.message(Command("status"))
+async def cmd_status(message: Message) -> None:
+    raw_status = await get_queue_status()
+    await message.answer(html.escape(raw_status))
 
 
-async def process_pending_gallery(gallery_id: int) -> None:
-    """
-    Worker task: scrapes metadata and downloads images for a queued gallery.
-    Updates status to DOWNLOADED upon success.
-    """
-    harvester = EhentaiHarvester()
+@router.message(Command("add"))
+async def cmd_add(message: Message) -> None:
+    if not message.text:
+        return
 
-    async with AsyncSessionLocal() as session:
-        gallery = await session.get(Gallery, gallery_id)
-        if not gallery:
-            return
+    entities = message.text.split()
+    urls = [w for w in entities if ("e-hentai.org/g/" in w or "exhentai.org/g/" in w)]
 
+    if not urls:
+        await message.answer("Usage: /add &lt;url&gt;")
+        return
+
+    await message.answer(f"Queuing {len(urls)} galleries...")
+
+    results = []
+    for url in urls:
+        # Extract ID/Token for brevity in logs
+        short_name = url.split("/")[-3] if len(url.split("/")) > 3 else "Gallery"
         try:
-            data = await harvester.parse_gallery(gallery.source_url)
-            if not data:
-                gallery.status = PostStatus.FAILED
-                await session.commit()
-                return
-
-            gallery.title = data["title"]
-            gallery.tags = data["tags"]
-            gallery.local_images = data["local_images"]
-
-            # Calculate actual schedule slot only after successful download
-            schedule_time = await get_next_available_slot()
-            gallery.scheduled_for = schedule_time
-            gallery.status = PostStatus.DOWNLOADED
-
-            await session.commit()
+            res = await queue_gallery(url)
+            results.append(f"[OK] {short_name}: {res}")
+        except ServiceError as e:
+            results.append(f"[WARN] {short_name}: {str(e)}")
         except Exception:
-            gallery.status = PostStatus.FAILED
-            await session.commit()
-            raise
+            results.append(f"[ERR] {short_name}: System Error")
+
+    # Split long messages if necessary
+    response_text = "\n".join(results)
+    if len(response_text) > 4000:
+        response_text = response_text[:4000] + "..."
+
+    await message.answer(response_text)
 
 
-async def get_queue_status() -> str:
-    async with AsyncSessionLocal() as session:
-        pending = (
-            await session.execute(
-                select(func.count(Gallery.id)).where(
-                    Gallery.status == PostStatus.PENDING
-                )
-            )
-        ).scalar()
-        downloaded = (
-            await session.execute(
-                select(func.count(Gallery.id)).where(
-                    Gallery.status == PostStatus.DOWNLOADED
-                )
-            )
-        ).scalar()
-        return f"Queue Status:\n[PENDING] {pending}\n[READY TO UPLOAD] {downloaded}"
+async def start_bot() -> None:
+    bot = Bot(
+        token=settings.TG_BOT_TOKEN.get_secret_value(),
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
