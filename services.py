@@ -25,8 +25,6 @@ def generate_caption(gallery: Gallery) -> str:
     add_group("Персонаж", "character")
     add_group("Модель", "cosplayer")
 
-    lines.append("")
-    lines.append(f"Source: {gallery.source_url}")
     return "\n".join(lines)
 
 
