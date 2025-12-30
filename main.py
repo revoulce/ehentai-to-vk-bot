@@ -1,41 +1,62 @@
+# main.py
 import asyncio
-import random
 import sys
-from datetime import datetime, timezone
+import random
+import logging
 from pathlib import Path
-from typing import Awaitable, Callable
+from datetime import datetime, timezone
+from typing import Callable, Awaitable
 
 from aiohttp import web
-from loguru import logger
 from sqlalchemy import select
+from loguru import logger
 
 from config import settings
-from models import AsyncSessionLocal, Gallery, PostStatus, init_db
+from models import init_db, AsyncSessionLocal, Gallery, PostStatus
 from publisher import VkPublisher
+from tg_bot import start_bot
 from services import (
-    ServiceError,
+    queue_gallery,
+    process_pending_gallery,
     generate_caption,
     get_next_available_slot,
-    process_pending_gallery,
-    queue_gallery,
+    ServiceError,
 )
-from tg_bot import start_bot
+
 
 # --- Logging Setup ---
+class AccessLogger(logging.Logger):
+    """Mute aiohttp access logs to keep console clean"""
+
+    def info(self, msg, *args, **kwargs):
+        pass
+
+
+# Intercept standard logging to filter out aiohttp noise
+class AiohttpFilter(logging.Filter):
+    def filter(self, record):
+        # Filter out "Pause on PRI/Upgrade" and other scanner noise
+        msg = record.getMessage()
+        if "BadHttpMessage" in msg or "Pause on PRI" in msg:
+            return False
+        return True
+
+
+# Configure Loguru
 logger.remove()
 logger.add(sys.stderr, level="INFO")
 logger.add("bot.log", rotation="10 MB", level="DEBUG", compression="zip")
 
+# Apply filter to standard logging (used by aiohttp internals)
+logging.getLogger("aiohttp.server").addFilter(AiohttpFilter())
 
-# --- CORS Middleware ---
+# --- Middleware ---
+
+
 @web.middleware
 async def cors_middleware(
     request: web.Request, handler: Callable[[web.Request], Awaitable[web.Response]]
 ) -> web.Response:
-    """
-    Manual CORS handling to avoid external dependency issues.
-    Handles preflight OPTIONS and adds headers to all responses.
-    """
     if request.method == "OPTIONS":
         response = web.Response()
     else:
@@ -55,14 +76,33 @@ async def cors_middleware(
     return response
 
 
-# --- API Handlers ---
-async def api_queue_handler(request: web.Request) -> web.Response:
+@web.middleware
+async def security_middleware(
+    request: web.Request, handler: Callable[[web.Request], Awaitable[web.Response]]
+) -> web.Response:
+    """
+    Global security check.
+    If the user is unauthorized or trying to access wrong paths, send them away.
+    """
+    # Allow CORS preflight
+    if request.method == "OPTIONS":
+        return await handler(request)
+
+    # Check Authorization
     auth_header = request.headers.get("Authorization")
     expected_auth = f"Bearer {settings.API_SECRET.get_secret_value()}"
 
     if auth_header != expected_auth:
-        return web.json_response({"error": "Unauthorized"}, status=401)
+        logger.warning(f"Unauthorized access attempt from {request.remote}")
+        # The specific response requested by user
+        return web.Response(text="Go fuck yourself.", status=401)
 
+    return await handler(request)
+
+
+# --- API Handlers ---
+async def api_queue_handler(request: web.Request) -> web.Response:
+    # Auth is already handled by middleware
     try:
         data = await request.json()
         url = data.get("url")
@@ -83,20 +123,19 @@ async def api_queue_handler(request: web.Request) -> web.Response:
 
 
 async def start_api_server() -> None:
-    app = web.Application(middlewares=[cors_middleware])
+    # Order matters: CORS first, then Security
+    app = web.Application(middlewares=[cors_middleware, security_middleware])
     app.router.add_post("/api/queue", api_queue_handler)
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, access_log_class=AccessLogger)
     await runner.setup()
 
-    # Force bind to 0.0.0.0 to ensure Docker visibility
     site = web.TCPSite(runner, "0.0.0.0", settings.API_PORT)
 
     logger.info(f"API Server listening on 0.0.0.0:{settings.API_PORT}")
     await site.start()
 
     try:
-        # Keep the server running indefinitely
         await asyncio.Event().wait()
     finally:
         await runner.cleanup()
@@ -120,7 +159,6 @@ async def downloader_loop() -> None:
     while True:
         try:
             async with AsyncSessionLocal() as session:
-                # FIFO Queue processing
                 stmt = (
                     select(Gallery.id)
                     .where(Gallery.status == PostStatus.PENDING)
@@ -133,9 +171,9 @@ async def downloader_loop() -> None:
                 logger.info(f"Downloading Gallery ID: {gallery_id}")
                 await process_pending_gallery(gallery_id)
                 logger.success(f"Download complete ID: {gallery_id}")
-                await asyncio.sleep(5)  # Rate limiting
+                await asyncio.sleep(5)
             else:
-                await asyncio.sleep(10)  # Idle wait
+                await asyncio.sleep(10)
 
         except Exception as e:
             logger.exception(f"Downloader crash: {e}")
@@ -158,13 +196,11 @@ async def uploader_loop() -> None:
                 if gallery:
                     logger.info(f"Processing Upload: {gallery.title}")
 
-                    # Time Validation
                     now_utc = datetime.now(timezone.utc)
                     target_time = gallery.scheduled_for
                     if target_time.tzinfo is None:
                         target_time = target_time.replace(tzinfo=timezone.utc)
 
-                    # Ensure future scheduling (VK requirement)
                     if (target_time - now_utc).total_seconds() < 300:
                         new_time = await get_next_available_slot(from_time=now_utc)
                         gallery.scheduled_for = new_time
@@ -172,11 +208,9 @@ async def uploader_loop() -> None:
                         target_time = new_time
                         logger.info(f"Rescheduled to {new_time}")
 
-                    # Execution
                     publisher = VkPublisher()
                     message = generate_caption(gallery)
 
-                    # Select 4 random images
                     all_images = gallery.local_images
                     selected_images = random.sample(all_images, min(len(all_images), 4))
 
@@ -187,7 +221,6 @@ async def uploader_loop() -> None:
                         message, attachments, publish_date=unix_time
                     )
 
-                    # Finalize
                     gallery.status = PostStatus.POSTED
                     gallery.posted_at = datetime.now(timezone.utc)
                     gallery.vk_post_id = post_id
