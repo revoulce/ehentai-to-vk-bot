@@ -1,13 +1,12 @@
 import html
-
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message
+from aiogram.filters import Command, CommandStart
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
 
 from config import settings
-from services import ServiceError, add_gallery_task, get_queue_status
+from services import queue_gallery, get_queue_status, ServiceError
 
 router = Router()
 router.message.filter(F.from_user.id.in_(settings.ADMIN_IDS))
@@ -17,7 +16,7 @@ router.message.filter(F.from_user.id.in_(settings.ADMIN_IDS))
 async def cmd_start(message: Message) -> None:
     await message.answer(
         "<b>E-Hentai Manager</b>\n\n"
-        "/add &lt;url&gt; - Queue gallery\n"
+        "/add &lt;url&gt; [url2] ... - Queue galleries\n"
         "/status - Check queue"
     )
 
@@ -30,26 +29,36 @@ async def cmd_status(message: Message) -> None:
 
 @router.message(Command("add"))
 async def cmd_add(message: Message) -> None:
-    args = message.text.split()
-    if len(args) < 2:
+    if not message.text:
+        return
+
+    entities = message.text.split()
+    urls = [w for w in entities if ("e-hentai.org/g/" in w or "exhentai.org/g/" in w)]
+
+    if not urls:
         await message.answer("Usage: /add &lt;url&gt;")
         return
 
-    url = args[1]
-    if "e-hentai.org/g/" not in url and "exhentai.org/g/" not in url:
-        await message.answer("Invalid URL format.")
-        return
+    await message.answer(f"Queuing {len(urls)} galleries...")
 
-    status_msg = await message.answer("Processing...")
+    results = []
+    for url in urls:
+        # Extract ID/Token for brevity in logs
+        short_name = url.split("/")[-3] if len(url.split("/")) > 3 else "Gallery"
+        try:
+            res = await queue_gallery(url)
+            results.append(f"[OK] {short_name}: {res}")
+        except ServiceError as e:
+            results.append(f"[WARN] {short_name}: {str(e)}")
+        except Exception:
+            results.append(f"[ERR] {short_name}: System Error")
 
-    try:
-        result = await add_gallery_task(url)
-        await status_msg.edit_text(html.escape(result))
-    except ServiceError as e:
-        await status_msg.edit_text(f"Error: {html.escape(str(e))}")
-    except Exception as e:
-        await status_msg.edit_text("Critical system error.")
-        raise e
+    # Split long messages if necessary
+    response_text = "\n".join(results)
+    if len(response_text) > 4000:
+        response_text = response_text[:4000] + "..."
+
+    await message.answer(response_text)
 
 
 async def start_bot() -> None:
