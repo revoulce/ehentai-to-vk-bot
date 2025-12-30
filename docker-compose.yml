@@ -15,3 +15,5 @@ services:
     environment:
       - DB_URL=sqlite+aiosqlite:///./data/bot.db
     stop_grace_period: 30s
+    ports:
+      - "8080:8080"

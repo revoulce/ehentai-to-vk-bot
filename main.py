@@ -1,40 +1,164 @@
+# main.py
 import asyncio
 import sys
 import random
+import logging
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Callable, Awaitable
+
+from aiohttp import web
 from sqlalchemy import select
 from loguru import logger
 
 from config import settings
 from models import init_db, AsyncSessionLocal, Gallery, PostStatus
 from publisher import VkPublisher
-from services import generate_caption, get_next_available_slot, process_pending_gallery
 from tg_bot import start_bot
+from services import (
+    queue_gallery,
+    process_pending_gallery,
+    generate_caption,
+    get_next_available_slot,
+    ServiceError,
+)
 
+
+# --- Logging Setup ---
+class AccessLogger(logging.Logger):
+    """Mute aiohttp access logs to keep console clean"""
+
+    def info(self, msg, *args, **kwargs):
+        pass
+
+
+# Intercept standard logging to filter out aiohttp noise
+class AiohttpFilter(logging.Filter):
+    def filter(self, record):
+        # Filter out "Pause on PRI/Upgrade" and other scanner noise
+        msg = record.getMessage()
+        if "BadHttpMessage" in msg or "Pause on PRI" in msg:
+            return False
+        return True
+
+
+# Configure Loguru
 logger.remove()
 logger.add(sys.stderr, level="INFO")
 logger.add("bot.log", rotation="10 MB", level="DEBUG", compression="zip")
 
+# Apply filter to standard logging (used by aiohttp internals)
+logging.getLogger("aiohttp.server").addFilter(AiohttpFilter())
+
+# --- Middleware ---
+
+
+@web.middleware
+async def cors_middleware(
+    request: web.Request, handler: Callable[[web.Request], Awaitable[web.Response]]
+) -> web.Response:
+    if request.method == "OPTIONS":
+        response = web.Response()
+    else:
+        try:
+            response = await handler(request)
+        except web.HTTPException as ex:
+            response = ex
+        except Exception as e:
+            logger.exception(f"API Handler Exception: {e}")
+            response = web.json_response(
+                {"status": "error", "message": "Internal Server Error"}, status=500
+            )
+
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+    return response
+
+
+@web.middleware
+async def security_middleware(
+    request: web.Request, handler: Callable[[web.Request], Awaitable[web.Response]]
+) -> web.Response:
+    """
+    Global security check.
+    If the user is unauthorized or trying to access wrong paths, send them away.
+    """
+    # Allow CORS preflight
+    if request.method == "OPTIONS":
+        return await handler(request)
+
+    # Check Authorization
+    auth_header = request.headers.get("Authorization")
+    expected_auth = f"Bearer {settings.API_SECRET.get_secret_value()}"
+
+    if auth_header != expected_auth:
+        logger.warning(f"Unauthorized access attempt from {request.remote}")
+        # The specific response requested by user
+        return web.Response(text="Go fuck yourself.", status=401)
+
+    return await handler(request)
+
+
+# --- API Handlers ---
+async def api_queue_handler(request: web.Request) -> web.Response:
+    # Auth is already handled by middleware
+    try:
+        data = await request.json()
+        url = data.get("url")
+        if not url:
+            return web.json_response({"error": "Missing URL"}, status=400)
+
+        result = await queue_gallery(url)
+        logger.info(f"API Queued: {url}")
+        return web.json_response({"status": "success", "message": result})
+
+    except ServiceError as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=409)
+    except Exception as e:
+        logger.error(f"API Request Error: {e}")
+        return web.json_response(
+            {"status": "error", "message": "Bad Request"}, status=400
+        )
+
+
+async def start_api_server() -> None:
+    # Order matters: CORS first, then Security
+    app = web.Application(middlewares=[cors_middleware, security_middleware])
+    app.router.add_post("/api/queue", api_queue_handler)
+
+    runner = web.AppRunner(app, access_log_class=AccessLogger)
+    await runner.setup()
+
+    site = web.TCPSite(runner, "0.0.0.0", settings.API_PORT)
+
+    logger.info(f"API Server listening on 0.0.0.0:{settings.API_PORT}")
+    await site.start()
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+
+
+# --- Background Workers ---
+
 
 async def cleanup_files(file_paths: list[str]) -> None:
-    """Offloads file deletion to a thread to avoid blocking the loop."""
     for path_str in file_paths:
         try:
             path = Path(path_str)
             if await asyncio.to_thread(path.exists):
                 await asyncio.to_thread(path.unlink)
         except Exception as e:
-            logger.warning(f"Failed to delete {path_str}: {e}")
+            logger.warning(f"Cleanup failed for {path_str}: {e}")
 
 
 async def downloader_loop() -> None:
-    """Consumes the PENDING queue."""
-    logger.info("Downloader started.")
+    logger.info("Downloader worker started.")
     while True:
         try:
             async with AsyncSessionLocal() as session:
-                # FIFO strategy
                 stmt = (
                     select(Gallery.id)
                     .where(Gallery.status == PostStatus.PENDING)
@@ -44,84 +168,69 @@ async def downloader_loop() -> None:
                 gallery_id = (await session.execute(stmt)).scalar_one_or_none()
 
             if gallery_id:
-                logger.info(f"Downloading ID: {gallery_id}")
+                logger.info(f"Downloading Gallery ID: {gallery_id}")
                 await process_pending_gallery(gallery_id)
-                logger.info(f"Download complete ID: {gallery_id}")
-                # Polite delay between scrapes
+                logger.success(f"Download complete ID: {gallery_id}")
                 await asyncio.sleep(5)
             else:
                 await asyncio.sleep(10)
 
         except Exception as e:
-            logger.exception(f"Downloader error: {e}")
+            logger.exception(f"Downloader crash: {e}")
             await asyncio.sleep(10)
 
 
-async def process_upload_queue() -> None:
-    """Single iteration of the upload logic."""
-    async with AsyncSessionLocal() as session:
-        stmt = (
-            select(Gallery)
-            .where(Gallery.status == PostStatus.DOWNLOADED)
-            .order_by(Gallery.scheduled_for)
-            .limit(1)
-        )
-        gallery = (await session.execute(stmt)).scalar_one_or_none()
-
-        if not gallery:
-            return
-
-        logger.info(f"Uploading: {gallery.title}")
-
-        # Validate Schedule Time
-        now_utc = datetime.now(timezone.utc)
-        target_time = gallery.scheduled_for
-        if target_time.tzinfo is None:
-            target_time = target_time.replace(tzinfo=timezone.utc)
-
-        # If time is past or too close, reschedule
-        if (target_time - now_utc).total_seconds() < 300:
-            logger.warning(f"Rescheduling {gallery.title}...")
-            new_time = await get_next_available_slot(from_time=now_utc)
-            gallery.scheduled_for = new_time
-            await session.commit()
-            target_time = new_time
-
-        publisher = VkPublisher()
-        try:
-            message = generate_caption(gallery)
-            all_images = gallery.local_images
-            selected_images = random.sample(all_images, min(len(all_images), 4))
-
-            attachments = await publisher.upload_photos(selected_images)
-
-            unix_time = int(target_time.timestamp())
-            post_id = await publisher.publish(
-                message, attachments, publish_date=unix_time
-            )
-
-            gallery.status = PostStatus.POSTED
-            gallery.posted_at = datetime.now(timezone.utc)
-            gallery.vk_post_id = post_id
-
-            await session.commit()
-            logger.success(f"Scheduled in VK: {gallery.title}")
-
-            await cleanup_files(gallery.local_images)
-
-        except Exception as e:
-            logger.error(f"Upload failed for {gallery.id}: {e}")
-            # Logic to mark as FAILED or retry could be added here
-
-
 async def uploader_loop() -> None:
-    """Consumes the DOWNLOADED queue."""
-    logger.info("Uploader started.")
+    logger.info("Uploader worker started.")
     while True:
         try:
-            await process_upload_queue()
+            async with AsyncSessionLocal() as session:
+                stmt = (
+                    select(Gallery)
+                    .where(Gallery.status == PostStatus.DOWNLOADED)
+                    .order_by(Gallery.scheduled_for)
+                    .limit(1)
+                )
+                gallery = (await session.execute(stmt)).scalar_one_or_none()
+
+                if gallery:
+                    logger.info(f"Processing Upload: {gallery.title}")
+
+                    now_utc = datetime.now(timezone.utc)
+                    target_time = gallery.scheduled_for
+                    if target_time.tzinfo is None:
+                        target_time = target_time.replace(tzinfo=timezone.utc)
+
+                    if (target_time - now_utc).total_seconds() < 300:
+                        new_time = await get_next_available_slot(from_time=now_utc)
+                        gallery.scheduled_for = new_time
+                        await session.commit()
+                        target_time = new_time
+                        logger.info(f"Rescheduled to {new_time}")
+
+                    publisher = VkPublisher()
+                    message = generate_caption(gallery)
+
+                    all_images = gallery.local_images
+                    selected_images = random.sample(all_images, min(len(all_images), 4))
+
+                    attachments = await publisher.upload_photos(selected_images)
+                    unix_time = int(target_time.timestamp())
+
+                    post_id = await publisher.publish(
+                        message, attachments, publish_date=unix_time
+                    )
+
+                    gallery.status = PostStatus.POSTED
+                    gallery.posted_at = datetime.now(timezone.utc)
+                    gallery.vk_post_id = post_id
+                    await session.commit()
+
+                    logger.success(f"Scheduled in VK: {gallery.title}")
+                    await cleanup_files(gallery.local_images)
+
         except Exception as e:
-            logger.exception(f"Uploader error: {e}")
+            logger.exception(f"Uploader crash: {e}")
 
         await asyncio.sleep(30)
 
@@ -129,14 +238,14 @@ async def uploader_loop() -> None:
 async def main() -> None:
     await init_db()
 
-    # TaskGroup manages the lifecycle of concurrent tasks
     try:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(start_bot())
             tg.create_task(downloader_loop())
             tg.create_task(uploader_loop())
+            tg.create_task(start_api_server())
     except Exception as e:
-        logger.critical(f"System crash: {e}")
+        logger.critical(f"System critical failure: {e}")
 
 
 if __name__ == "__main__":
@@ -145,4 +254,4 @@ if __name__ == "__main__":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Shutdown.")
+        logger.info("Graceful shutdown.")
