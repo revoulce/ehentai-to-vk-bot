@@ -1,3 +1,5 @@
+from typing import Optional
+
 import aiohttp
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_fixed
@@ -16,7 +18,6 @@ class VkPublisher:
 
     async def _request(self, method: str, params: dict) -> dict:
         final_params = {**self.session_params, **params}
-
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{self.base_url}{method}", data=final_params
@@ -42,8 +43,6 @@ class VkPublisher:
             return []
 
         attachments = []
-
-        # 1. Get Upload Server (Requires Group ID even with User Token for group wall)
         server_data = await self._request(
             "photos.getWallUploadServer", {"group_id": self.group_id}
         )
@@ -55,7 +54,6 @@ class VkPublisher:
                     with open(path, "rb") as f:
                         data = aiohttp.FormData()
                         data.add_field("photo", f, filename="img.jpg")
-
                         async with session.post(upload_url, data=data) as upload_resp:
                             upload_result = await upload_resp.json()
 
@@ -63,40 +61,41 @@ class VkPublisher:
                         not upload_result.get("photo")
                         or upload_result.get("photo") == "[]"
                     ):
-                        logger.warning(f"Upload failed: {path}")
                         continue
 
-                    # 2. Save Photo (Requires Group ID)
                     save_params = {
                         "group_id": self.group_id,
                         "photo": upload_result["photo"],
                         "server": upload_result["server"],
                         "hash": upload_result["hash"],
                     }
-
                     saved_photos = await self._request(
                         "photos.saveWallPhoto", save_params
                     )
-
                     if saved_photos:
                         p = saved_photos[0]
                         attachments.append(f"photo{p['owner_id']}_{p['id']}")
-
                 except Exception as e:
                     logger.error(f"Image processing error {path}: {e}")
                     continue
-
         return attachments
 
-    async def publish(self, message: str, attachments: list[str]) -> int:
+    async def publish(
+        self, message: str, attachments: list[str], publish_date: Optional[int] = None
+    ) -> int:
         params = {
-            "owner_id": -self.group_id,  # Negative for Group
-            "from_group": 1,  # Post as Group
+            "owner_id": -self.group_id,
+            "from_group": 1,
             "message": message,
             "attachments": ",".join(attachments),
+            "primary_attachments_mode": "grid",
         }
+
+        # Add scheduling if provided
+        if publish_date:
+            params["publish_date"] = publish_date
 
         response = await self._request("wall.post", params)
         post_id = response.get("post_id")
-        logger.info(f"Published post ID: {post_id}")
+        logger.info(f"Published (Scheduled: {bool(publish_date)}). Post ID: {post_id}")
         return post_id

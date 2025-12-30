@@ -1,3 +1,4 @@
+import random
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
@@ -5,49 +6,83 @@ from sqlalchemy import func, select
 from config import settings
 from models import AsyncSessionLocal, Gallery, PostStatus
 from scraper import EhentaiHarvester
+from utils import process_tags
 
 
 class ServiceError(Exception):
     pass
 
 
+def generate_caption(gallery: Gallery) -> str:
+    tags_dict = gallery.tags
+    lines = [gallery.title, ""]
+
+    def add_group(label: str, key: str):
+        if key in tags_dict and tags_dict[key]:
+            processed = process_tags(tags_dict[key])
+            if processed:
+                lines.append(f"{label}: {' '.join(processed)}")
+
+    add_group("Фэндом", "parody")
+    add_group("Персонаж", "character")
+    add_group("Модель", "cosplayer")
+
+    return "\n".join(lines)
+
+
+async def get_next_available_slot(from_time: datetime | None = None) -> datetime:
+    """
+    Calculates the next valid round hour slot.
+    If from_time is provided, it searches after that time.
+    Otherwise, it searches after the last scheduled post in DB.
+    """
+    now_utc = datetime.now(timezone.utc)
+
+    async with AsyncSessionLocal() as session:
+        # Find the absolute latest scheduled time in the system
+        stmt = select(func.max(Gallery.scheduled_for))
+        last_db_time = (await session.execute(stmt)).scalar()
+
+        if last_db_time and last_db_time.tzinfo is None:
+            last_db_time = last_db_time.replace(tzinfo=timezone.utc)
+
+    # Determine the baseline to start counting from
+    # If we are rescheduling a specific post, we don't care about last_db_time,
+    # we just want the next slot relative to NOW or the provided time.
+    if from_time:
+        base_time = max(from_time, now_utc)
+    else:
+        # New post logic: append to the end of the queue
+        base_time = max(last_db_time, now_utc) if last_db_time else now_utc
+
+    # Round up to next hour
+    # Example: 14:05 -> 15:00. 14:59 -> 15:00.
+    next_hour = base_time.replace(minute=0, second=0, microsecond=0) + timedelta(
+        hours=1
+    )
+
+    # Safety: Ensure we are at least 5 minutes in the future for VK API
+    if (next_hour - now_utc).total_seconds() < 300:
+        next_hour += timedelta(hours=1)
+
+    return next_hour
+
+
 async def add_gallery_task(url: str) -> str:
-    """
-    Orchestrates scraping and scheduling.
-    Atomic DB check-then-insert.
-    """
     harvester = EhentaiHarvester()
 
-    # 1. Pre-check
     async with AsyncSessionLocal() as session:
         stmt = select(Gallery).where(Gallery.source_url == url)
         if (await session.execute(stmt)).scalar():
             raise ServiceError("Gallery already exists.")
 
-    # 2. Scrape (Time consuming)
     data = await harvester.parse_gallery(url)
     if not data:
-        raise ServiceError("Parsing failed or tags blacklisted.")
+        raise ServiceError("Parsing failed.")
 
-    # 3. Schedule & Save
+    schedule_time = await get_next_available_slot()
+
     async with AsyncSessionLocal() as session:
-        # Calculate schedule time based on last scheduled post
-        last_post_stmt = select(func.max(Gallery.scheduled_for))
-        last_time = (await session.execute(last_post_stmt)).scalar()
-
-        now_utc = datetime.now(timezone.utc)
-
-        # Ensure last_time is timezone-aware
-        if last_time and last_time.tzinfo is None:
-            last_time = last_time.replace(tzinfo=timezone.utc)
-
-        if not last_time or last_time < now_utc:
-            schedule_time = now_utc + timedelta(minutes=5)
-        else:
-            schedule_time = last_time + timedelta(
-                minutes=settings.SCHEDULE_INTERVAL_MINUTES
-            )
-
         new_gallery = Gallery(
             source_url=data["source_url"],
             title=data["title"],
@@ -64,26 +99,11 @@ async def add_gallery_task(url: str) -> str:
 
 async def get_queue_status() -> str:
     async with AsyncSessionLocal() as session:
-        count_stmt = select(func.count(Gallery.id)).where(
-            Gallery.status == PostStatus.DOWNLOADED
-        )
-        count = (await session.execute(count_stmt)).scalar() or 0
-
-        next_stmt = (
-            select(Gallery)
-            .where(Gallery.status == PostStatus.DOWNLOADED)
-            .order_by(Gallery.scheduled_for)
-            .limit(1)
-        )
-
-        next_post = (await session.execute(next_stmt)).scalar_one_or_none()
-
-        lines = [f"Queue size: {count}"]
-        if next_post:
-            ts = next_post.scheduled_for.strftime("%H:%M UTC")
-            lines.append(f"Next: {next_post.title}")
-            lines.append(f"Time: {ts}")
-        else:
-            lines.append("Queue is empty.")
-
-        return "\n".join(lines)
+        count = (
+            await session.execute(
+                select(func.count(Gallery.id)).where(
+                    Gallery.status == PostStatus.DOWNLOADED
+                )
+            )
+        ).scalar()
+        return f"Pending upload to VK: {count}"

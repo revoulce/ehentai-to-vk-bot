@@ -26,7 +26,6 @@ class EhentaiHarvester:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Referer": "https://e-hentai.org/",
         }
-        # Limit concurrency strictly to avoid IP bans since we are not using proxies
         self.sem = asyncio.Semaphore(1)
 
     def _get_session_kwargs(self) -> Dict[str, Any]:
@@ -41,7 +40,7 @@ class EhentaiHarvester:
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception_type((ClientError, asyncio.TimeoutError)),
-        before_sleep=before_sleep_log(logger, "WARNING"),
+        reraise=True,
     )
     async def fetch_text(self, session: ClientSession, url: str) -> str:
         async with session.get(url) as resp:
@@ -63,8 +62,6 @@ class EhentaiHarvester:
         async with session.get(url) as resp:
             resp.raise_for_status()
             content = await resp.read()
-
-            # CPU-bound file writing offloaded to thread
             await asyncio.to_thread(self._write_file, dest, content)
             return dest
 
@@ -87,26 +84,40 @@ class EhentaiHarvester:
                         logger.error(f"Failed to extract title: {url}")
                         return None
 
-                    # 2. Tags
-                    tags = sel.css(
-                        "div#taglist tr td:nth-child(2) div a::text"
-                    ).getall()
-                    if any(t in settings.TAG_BLACKLIST for t in tags):
+                    # 2. Tags with Namespaces (NEW)
+                    # Structure: dict {"parody": ["tag1", "tag2"], "character": [...]}
+                    tags_data: Dict[str, List[str]] = {}
+
+                    # Iterate over rows in taglist
+                    tag_rows = sel.css("div#taglist table tr")
+                    for row in tag_rows:
+                        # Namespace is in the first td, e.g., "parody:"
+                        ns = row.css("td.tc::text").get()
+                        if ns:
+                            ns = ns.strip().rstrip(":")
+                            # Tags are in the second td
+                            t_list = row.css("td:nth-child(2) div a::text").getall()
+                            tags_data[ns] = t_list
+
+                    # Check blacklist (flatten tags for check)
+                    all_tags = [t for sublist in tags_data.values() for t in sublist]
+                    if any(t in settings.TAG_BLACKLIST for t in all_tags):
                         logger.warning(f"Blacklisted tags in {title}")
                         return None
 
-                    # 3. Image Links (Universal Selector)
+                    # 3. Image Links
+                    # Download more images (up to 15) to allow random selection of 4
                     raw_urls = sel.css("div#gdt a[href*='/s/']::attr(href)").getall()
 
-                    # Deduplicate
-                    seen: set[str] = set()
-                    image_page_urls: List[str] = []
+                    seen = set()
+                    image_page_urls = []
                     for u in raw_urls:
                         if u not in seen:
                             image_page_urls.append(u)
                             seen.add(u)
 
-                    image_page_urls = image_page_urls[:10]
+                    # Get up to 15 images to have a pool for random selection
+                    image_page_urls = image_page_urls[:15]
 
                     if not image_page_urls:
                         logger.error(f"No images found for: {title}")
@@ -115,9 +126,7 @@ class EhentaiHarvester:
                     # 4. Download
                     image_paths: List[str] = []
                     for idx, page_url in enumerate(image_page_urls):
-                        # Increased delay slightly since we are direct connection
-                        await asyncio.sleep(random.uniform(1.0, 3.0))
-
+                        await asyncio.sleep(random.uniform(1.0, 2.5))
                         try:
                             page_html = await self.fetch_text(session, page_url)
                             page_sel = Selector(text=page_html)
@@ -146,7 +155,7 @@ class EhentaiHarvester:
                     return {
                         "title": title,
                         "source_url": url,
-                        "tags": tags,
+                        "tags": tags_data,  # Now storing dict
                         "local_images": image_paths,
                     }
 
