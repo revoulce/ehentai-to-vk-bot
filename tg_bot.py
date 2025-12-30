@@ -1,17 +1,15 @@
 import html
 
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
 from config import settings
-from services import add_gallery_task, get_queue_status, ServiceError
+from services import ServiceError, add_gallery_task, get_queue_status
 
 router = Router()
-
-# Security: Whitelist only
 router.message.filter(F.from_user.id.in_(settings.ADMIN_IDS))
 
 
@@ -27,7 +25,6 @@ async def cmd_start(message: Message) -> None:
 @router.message(Command("status"))
 async def cmd_status(message: Message) -> None:
     raw_status = await get_queue_status()
-    # Escape to prevent HTML parsing errors from user content
     await message.answer(html.escape(raw_status))
 
 
@@ -58,7 +55,7 @@ async def cmd_add(message: Message) -> None:
 async def start_bot() -> None:
     bot = Bot(
         token=settings.TG_BOT_TOKEN.get_secret_value(),
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
     dp.include_router(router)

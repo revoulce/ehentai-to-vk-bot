@@ -1,36 +1,40 @@
 from pathlib import Path
+from typing import Dict, List, Optional, Set
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # VK Configuration
+    # VK (User Token required for group wall posting)
     VK_ACCESS_TOKEN: SecretStr
     VK_GROUP_ID: int
     VK_API_VERSION: str = "5.199"
 
-    # Telegram Configuration
+    # Telegram
     TG_BOT_TOKEN: SecretStr
-    ADMIN_IDS: list[int]
+    ADMIN_IDS: List[int]
 
-    # E-Hentai Configuration
-    EH_COOKIES: dict[str, str]
-    EH_PROXY: str | None = None
+    # E-Hentai
+    EH_COOKIES: Dict[str, str]
 
-    # System Configuration
+    # Core
     DB_URL: str = "sqlite+aiosqlite:///./data/bot.db"
     STORAGE_PATH: Path = Path("./downloads")
     SCHEDULE_INTERVAL_MINUTES: int = 60
 
-    # Filtering
-    TAG_BLACKLIST: set[str] = {"guro", "scat", "furry", "lolicon", "shotacon"}
+    # Filters
+    TAG_BLACKLIST: Set[str] = {
+        "guro",
+        "scat",
+        "furry",
+        "lolicon",
+        "shotacon",
+        "bestiality",
+    }
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        case_sensitive=True
+        env_file=".env", env_file_encoding="utf-8", extra="ignore", case_sensitive=True
     )
 
 

@@ -1,4 +1,4 @@
-FROM python:3.14-rc-slim-bookworm as builder
+FROM python:3.13-slim-bookworm as builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -22,7 +22,7 @@ COPY requirements.txt .
 RUN pip install --upgrade pip setuptools wheel && \
     pip install -r requirements.txt
 
-FROM python:3.14-rc-slim-bookworm
+FROM python:3.13-slim-bookworm
 
 WORKDIR /app
 
@@ -36,12 +36,10 @@ ENV PATH="/opt/venv/bin:$PATH"
 ENV TZ="Europe/Moscow"
 
 RUN useradd -m -u 1000 botuser && \
+    mkdir -p downloads data && \
     chown -R botuser:botuser /app
 
 COPY --chown=botuser:botuser . .
-
-RUN mkdir -p downloads data && \
-    chown -R botuser:botuser downloads data
 
 USER botuser
 

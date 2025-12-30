@@ -2,12 +2,19 @@ import asyncio
 import hashlib
 import random
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
-from aiohttp import ClientTimeout, ClientSession, ClientError
+import aiohttp
+from aiohttp import ClientError, ClientSession, ClientTimeout
 from loguru import logger
 from parsel import Selector
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from config import settings
 
@@ -19,29 +26,25 @@ class EhentaiHarvester:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Referer": "https://e-hentai.org/",
         }
-        self.sem = asyncio.Semaphore(2)
-
-        # Proxy validation
-        self.proxy = settings.EH_PROXY
-        if self.proxy and "1.2.3.4" in self.proxy:
-            self.proxy = None
+        # Limit concurrency strictly to avoid IP bans since we are not using proxies
+        self.sem = asyncio.Semaphore(1)
 
     def _get_session_kwargs(self) -> Dict[str, Any]:
         return {
             "headers": self.headers,
             "cookies": settings.EH_COOKIES,
-            "timeout": ClientTimeout(total=60, connect=15, sock_read=30),
-            "trust_env": True
+            "timeout": ClientTimeout(total=45, connect=10, sock_read=30),
+            "trust_env": True,
         }
 
     @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=4, max=20),
-        retry=retry_if_exception_type((ClientError, asyncio.TimeoutError, ConnectionResetError)),
-        before_sleep=before_sleep_log(logger, "WARNING")
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((ClientError, asyncio.TimeoutError)),
+        before_sleep=before_sleep_log(logger, "WARNING"),
     )
     async def fetch_text(self, session: ClientSession, url: str) -> str:
-        async with session.get(url, proxy=self.proxy) as resp:
+        async with session.get(url) as resp:
             resp.raise_for_status()
             return await resp.text()
 
@@ -49,18 +52,20 @@ class EhentaiHarvester:
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception_type((ClientError, asyncio.TimeoutError)),
-        reraise=True
+        reraise=True,
     )
-    async def download_image(self, session: ClientSession, url: str, dest: Path) -> Path:
+    async def download_image(
+        self, session: ClientSession, url: str, dest: Path
+    ) -> Path:
         if dest.exists() and dest.stat().st_size > 0:
             return dest
 
-        async with session.get(url, proxy=self.proxy) as resp:
+        async with session.get(url) as resp:
             resp.raise_for_status()
             content = await resp.read()
 
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._write_file, dest, content)
+            # CPU-bound file writing offloaded to thread
+            await asyncio.to_thread(self._write_file, dest, content)
             return dest
 
     @staticmethod
@@ -76,43 +81,42 @@ class EhentaiHarvester:
                     html = await self.fetch_text(session, url)
                     sel = Selector(text=html)
 
-                    # 1. Extract Title
+                    # 1. Title
                     title = sel.css("h1#gn::text").get() or sel.css("h1#gj::text").get()
                     if not title:
-                        logger.error(f"Failed to extract title from {url}")
+                        logger.error(f"Failed to extract title: {url}")
                         return None
 
-                    # 2. Extract Tags
-                    tags = sel.css("div#taglist tr td:nth-child(2) div a::text").getall()
+                    # 2. Tags
+                    tags = sel.css(
+                        "div#taglist tr td:nth-child(2) div a::text"
+                    ).getall()
                     if any(t in settings.TAG_BLACKLIST for t in tags):
                         logger.warning(f"Blacklisted tags in {title}")
                         return None
 
-                    # 3. Extract Image Links (Robust Method)
-                    # We look for ANY link inside #gdt that contains '/s/' (which denotes an image page)
+                    # 3. Image Links (Universal Selector)
                     raw_urls = sel.css("div#gdt a[href*='/s/']::attr(href)").getall()
 
-                    # Deduplicate preserving order
-                    seen = set()
-                    image_page_urls = []
+                    # Deduplicate
+                    seen: set[str] = set()
+                    image_page_urls: List[str] = []
                     for u in raw_urls:
                         if u not in seen:
                             image_page_urls.append(u)
                             seen.add(u)
 
-                    # Take first 10
                     image_page_urls = image_page_urls[:10]
 
                     if not image_page_urls:
-                        logger.error(f"Found 0 images. HTML dump snippet: {html[:500]}")
+                        logger.error(f"No images found for: {title}")
                         return None
 
-                    logger.info(f"Found {len(image_page_urls)} images for: {title}")
-
-                    # 4. Download Images
-                    image_paths = []
+                    # 4. Download
+                    image_paths: List[str] = []
                     for idx, page_url in enumerate(image_page_urls):
-                        await asyncio.sleep(random.uniform(0.5, 1.5))
+                        # Increased delay slightly since we are direct connection
+                        await asyncio.sleep(random.uniform(1.0, 3.0))
 
                         try:
                             page_html = await self.fetch_text(session, page_url)
@@ -120,10 +124,14 @@ class EhentaiHarvester:
                             img_src = page_sel.css("img#img::attr(src)").get()
 
                             if img_src:
-                                ext = img_src.split('.')[-1].split('?')[0]
-                                if len(ext) > 4: ext = "jpg"
+                                ext = img_src.split(".")[-1].split("?")[0]
+                                if len(ext) > 4:
+                                    ext = "jpg"
 
-                                fname = hashlib.md5(f"{url}_{idx}".encode()).hexdigest() + f".{ext}"
+                                fname = (
+                                    hashlib.md5(f"{url}_{idx}".encode()).hexdigest()
+                                    + f".{ext}"
+                                )
                                 local_path = settings.STORAGE_PATH / fname
 
                                 await self.download_image(session, img_src, local_path)
@@ -139,7 +147,7 @@ class EhentaiHarvester:
                         "title": title,
                         "source_url": url,
                         "tags": tags,
-                        "local_images": image_paths
+                        "local_images": image_paths,
                     }
 
                 except Exception as e:
