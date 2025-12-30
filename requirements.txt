@@ -7,3 +7,4 @@ parsel
 loguru
 tenacity
 aiogram
+aiohttp_cors

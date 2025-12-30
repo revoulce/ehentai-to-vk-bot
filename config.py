@@ -1,12 +1,12 @@
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Set
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # VK (User Token required for group wall posting)
+    # VK
     VK_ACCESS_TOKEN: SecretStr
     VK_GROUP_ID: int
     VK_API_VERSION: str = "5.199"
@@ -18,12 +18,16 @@ class Settings(BaseSettings):
     # E-Hentai
     EH_COOKIES: Dict[str, str]
 
-    # Core
+    # API (New)
+    API_HOST: str = "0.0.0.0"
+    API_PORT: int = 8080
+    API_SECRET: SecretStr = SecretStr("change_me_in_env")
+
+    # System
     DB_URL: str = "sqlite+aiosqlite:///./data/bot.db"
     STORAGE_PATH: Path = Path("./downloads")
     SCHEDULE_INTERVAL_MINUTES: int = 60
 
-    # Filters
     TAG_BLACKLIST: Set[str] = {
         "guro",
         "scat",
