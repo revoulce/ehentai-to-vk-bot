@@ -23,7 +23,7 @@ def generate_caption(gallery: Gallery) -> str:
 
     add_group("Фэндом", "parody")
     add_group("Персонаж", "character")
-    add_group("Модель", "cosplayer")
+    # add_group("Модель", "cosplayer")
 
     return "\n".join(lines)
 
