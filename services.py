@@ -14,7 +14,7 @@ def generate_caption(gallery: Gallery) -> str:
     """Constructs the VK post body from gallery metadata."""
     tags_dict = gallery.tags
     # lines = [gallery.title, ""]
-    lines = []  # Title is omitted for now to avoid VK copyright issues
+    lines = [""]  # Title is omitted for now to avoid VK copyright issues
 
     def add_group(label: str, key: str) -> None:
         if key in tags_dict and tags_dict[key]:
