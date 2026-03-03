@@ -42,43 +42,42 @@ class VkPublisher:
         if not file_paths:
             return []
 
-        attachments = []
         server_data = await self._request(
             "photos.getWallUploadServer", {"group_id": self.group_id}
         )
         upload_url = server_data["upload_url"]
 
-        async with aiohttp.ClientSession() as session:
-            for path in file_paths:
-                try:
-                    with open(path, "rb") as f:
-                        data = aiohttp.FormData()
-                        data.add_field("photo", f, filename="img.jpg")
-                        async with session.post(upload_url, data=data) as upload_resp:
-                            upload_result = await upload_resp.json()
+        data = aiohttp.FormData()
+        opened_files = []
+        try:
+            for i, path in enumerate(file_paths[:5], start=1):
+                f = open(path, "rb")
+                opened_files.append(f)
+                data.add_field(f"photo{i}", f, filename=f"img{i}.jpg")
 
-                    if (
-                        not upload_result.get("photo")
-                        or upload_result.get("photo") == "[]"
-                    ):
-                        continue
+            async with aiohttp.ClientSession() as session:
+                async with session.post(upload_url, data=data) as upload_resp:
+                    upload_result = await upload_resp.json()
+        finally:
+            for f in opened_files:
+                f.close()
 
-                    save_params = {
-                        "group_id": self.group_id,
-                        "photo": upload_result["photo"],
-                        "server": upload_result["server"],
-                        "hash": upload_result["hash"],
-                    }
-                    saved_photos = await self._request(
-                        "photos.saveWallPhoto", save_params
-                    )
-                    if saved_photos:
-                        p = saved_photos[0]
-                        attachments.append(f"photo{p['owner_id']}_{p['id']}")
-                except Exception as e:
-                    logger.error(f"Image processing error {path}: {e}")
-                    continue
-        return attachments
+        if (
+            not upload_result
+            or not upload_result.get("photo")
+            or upload_result.get("photo") == "[]"
+        ):
+            return []
+
+        save_params = {
+            "group_id": self.group_id,
+            "photo": upload_result["photo"],
+            "server": upload_result["server"],
+            "hash": upload_result["hash"],
+        }
+
+        saved_photos = await self._request("photos.saveWallPhoto", save_params)
+        return [f"photo{p['owner_id']}_{p['id']}" for p in saved_photos]
 
     async def publish(
         self, message: str, attachments: list[str], publish_date: Optional[int] = None

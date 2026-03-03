@@ -11,7 +11,6 @@ class ServiceError(Exception):
 
 
 def generate_caption(gallery: Gallery) -> str:
-    """Constructs the VK post body from gallery metadata."""
     tags_dict = gallery.tags
     lines = []
 
@@ -23,16 +22,11 @@ def generate_caption(gallery: Gallery) -> str:
 
     add_group("Фэндом", "parody")
     add_group("Персонаж", "character")
-    # add_group("Модель", "cosplayer")
 
     return "\n".join(lines)
 
 
 async def get_next_available_slot(from_time: datetime | None = None) -> datetime:
-    """
-    Determines the next valid hourly slot for scheduling.
-    Ensures a minimum 5-minute buffer from the current time.
-    """
     now_utc = datetime.now(timezone.utc)
 
     async with AsyncSessionLocal() as session:
@@ -42,10 +36,13 @@ async def get_next_available_slot(from_time: datetime | None = None) -> datetime
         if last_db_time and last_db_time.tzinfo is None:
             last_db_time = last_db_time.replace(tzinfo=timezone.utc)
 
+    times = [now_utc]
     if from_time:
-        base_time = max(from_time, now_utc)
-    else:
-        base_time = max(last_db_time, now_utc) if last_db_time else now_utc
+        times.append(from_time)
+    if last_db_time:
+        times.append(last_db_time)
+
+    base_time = max(times)
 
     next_hour = base_time.replace(minute=0, second=0, microsecond=0) + timedelta(
         hours=1
@@ -58,10 +55,6 @@ async def get_next_available_slot(from_time: datetime | None = None) -> datetime
 
 
 async def queue_gallery(url: str) -> str:
-    """
-    Fast-path: inserts a placeholder record into the DB.
-    Actual processing happens in the background downloader loop.
-    """
     async with AsyncSessionLocal() as session:
         stmt = select(Gallery).where(Gallery.source_url == url)
         if (await session.execute(stmt)).scalar():
@@ -82,10 +75,6 @@ async def queue_gallery(url: str) -> str:
 
 
 async def process_pending_gallery(gallery_id: int) -> None:
-    """
-    Worker task: scrapes metadata and downloads images for a queued gallery.
-    Updates status to DOWNLOADED upon success.
-    """
     harvester = EhentaiHarvester()
 
     async with AsyncSessionLocal() as session:

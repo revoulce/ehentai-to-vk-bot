@@ -96,7 +96,7 @@ class EhentaiHarvester:
                             t_list = row.css("td:nth-child(2) div a::text").getall()
                             tags_data[ns] = t_list
 
-                    all_tags = [t for sublist in tags_data.values() for t in sublist]
+                    all_tags =[t for sublist in tags_data.values() for t in sublist]
                     if any(t in settings.TAG_BLACKLIST for t in all_tags):
                         logger.warning(f"Blacklisted tags in {title}")
                         return None
@@ -108,31 +108,32 @@ class EhentaiHarvester:
                         if match:
                             total_images = int(match.group(1).replace(",", ""))
 
-                    if total_images == 0:
-                        total_images = len(sel_p0.css("div#gdt a").getall())
-                        logger.warning(
-                            f"Could not parse total images count. Fallback to {total_images}"
-                        )
+                    page_0_links = list(dict.fromkeys(sel_p0.css("div#gdt a[href*='/s/']::attr(href)").getall()))
+                    page_size = len(page_0_links)
 
-                    logger.info(f"Total images in gallery: {total_images}")
+                    if page_size == 0:
+                        logger.error("No images found on page 0")
+                        return None
+
+                    if total_images == 0:
+                        total_images = page_size
+
+                    logger.info(f"Total images: {total_images}, Page size: {page_size}")
 
                     target_count = min(total_images, 4)
                     target_indices = set(
                         random.sample(range(total_images), target_count)
                     )
 
-                    PAGE_SIZE = 20
                     pages_to_fetch: Dict[int, Set[int]] = {}
-
                     for global_idx in target_indices:
-                        page_num = global_idx // PAGE_SIZE
-                        local_idx = global_idx % PAGE_SIZE
+                        page_num = global_idx // page_size
+                        local_idx = global_idx % page_size
                         if page_num not in pages_to_fetch:
                             pages_to_fetch[page_num] = set()
                         pages_to_fetch[page_num].add(local_idx)
 
-                    image_page_urls: List[str] = []
-
+                    image_page_urls: List[str] =[]
                     for page_num, local_indices in pages_to_fetch.items():
                         if page_num == 0:
                             sel = sel_p0
@@ -143,16 +144,7 @@ class EhentaiHarvester:
                             page_html = await self.fetch_text(session, page_url)
                             sel = Selector(text=page_html)
 
-                        raw_links = sel.css(
-                            "div#gdt a[href*='/s/']::attr(href)"
-                        ).getall()
-
-                        unique_links = []
-                        seen = set()
-                        for link in raw_links:
-                            if link not in seen:
-                                unique_links.append(link)
-                                seen.add(link)
+                        unique_links = list(dict.fromkeys(sel.css("div#gdt a[href*='/s/']::attr(href)").getall()))
 
                         for local_idx in local_indices:
                             if local_idx < len(unique_links):
@@ -166,7 +158,7 @@ class EhentaiHarvester:
                         logger.error("No image links found after traversing pages.")
                         return None
 
-                    image_paths: List[str] = []
+                    image_paths: List[str] =[]
                     for idx, page_url in enumerate(image_page_urls):
                         await asyncio.sleep(random.uniform(1.0, 2.0))
                         try:
