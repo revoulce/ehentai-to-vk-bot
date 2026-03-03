@@ -1,4 +1,3 @@
-# main.py
 import asyncio
 import sys
 import random
@@ -23,29 +22,21 @@ from services import (
     ServiceError,
 )
 
-# --- Logging Configuration ---
 
 
-# Filter to suppress "BadHttpMessage" (Scanner noise) from aiohttp.server
 class AiohttpScannerFilter(logging.Filter):
     def filter(self, record):
         msg = record.getMessage()
-        # Suppress "Pause on PRI" and "BadHttpMessage" errors caused by port scanners
         if "BadHttpMessage" in msg or "Pause on PRI" in msg:
             return False
         return True
 
 
-# Configure Loguru
 logger.remove()
 logger.add(sys.stderr, level="INFO")
 logger.add("bot.log", rotation="10 MB", level="DEBUG", compression="zip")
 
-# Apply filter to standard python logging used by aiohttp
 logging.getLogger("aiohttp.server").addFilter(AiohttpScannerFilter())
-
-# --- Middleware ---
-
 
 @web.middleware
 async def cors_middleware(
@@ -77,7 +68,6 @@ async def security_middleware(
     """
     Blocks unauthorized access with a custom message.
     """
-    # Allow CORS preflight (OPTIONS) without auth
     if request.method == "OPTIONS":
         return await handler(request)
 
@@ -85,19 +75,13 @@ async def security_middleware(
     expected_auth = f"Bearer {settings.API_SECRET.get_secret_value()}"
 
     if auth_header != expected_auth:
-        # Log warning with IP
         logger.warning(f"Unauthorized access attempt from {request.remote}")
-        # Explicit rejection
         return web.Response(text="Иди нахуй.", status=401)
 
     return await handler(request)
 
 
-# --- API Handlers ---
-
-
 async def api_queue_handler(request: web.Request) -> web.Response:
-    # Auth is handled by security_middleware
     try:
         data = await request.json()
         url = data.get("url")
@@ -118,11 +102,9 @@ async def api_queue_handler(request: web.Request) -> web.Response:
 
 
 async def start_api_server() -> None:
-    # Middleware order: CORS first (to handle OPTIONS), then Security (to block others)
     app = web.Application(middlewares=[cors_middleware, security_middleware])
     app.router.add_post("/api/queue", api_queue_handler)
 
-    # access_log=None disables the "200 OK" spam in console
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
 
@@ -135,9 +117,6 @@ async def start_api_server() -> None:
         await asyncio.Event().wait()
     finally:
         await runner.cleanup()
-
-
-# --- Background Workers ---
 
 
 async def cleanup_files(file_paths: list[str]) -> None:
@@ -245,8 +224,6 @@ async def main() -> None:
 
 if __name__ == "__main__":
     try:
-        if sys.platform == "win32":
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Graceful shutdown.")

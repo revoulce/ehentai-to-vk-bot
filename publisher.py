@@ -91,7 +91,6 @@ class VkPublisher:
             "primary_attachments_mode": "grid",
         }
 
-        # Add scheduling if provided
         if publish_date:
             params["publish_date"] = publish_date
 

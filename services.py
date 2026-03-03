@@ -42,18 +42,15 @@ async def get_next_available_slot(from_time: datetime | None = None) -> datetime
         if last_db_time and last_db_time.tzinfo is None:
             last_db_time = last_db_time.replace(tzinfo=timezone.utc)
 
-    # Determine baseline: either the requested time, the last scheduled post, or now
     if from_time:
         base_time = max(from_time, now_utc)
     else:
         base_time = max(last_db_time, now_utc) if last_db_time else now_utc
 
-    # Round up to the next full hour
     next_hour = base_time.replace(minute=0, second=0, microsecond=0) + timedelta(
         hours=1
     )
 
-    # VK API requires publish_date to be strictly in the future
     if (next_hour - now_utc).total_seconds() < 300:
         next_hour += timedelta(hours=1)
 
@@ -76,7 +73,6 @@ async def queue_gallery(url: str) -> str:
             tags=[],
             local_images=[],
             status=PostStatus.PENDING,
-            # Placeholder time, updated after download
             scheduled_for=datetime.now(timezone.utc),
         )
         session.add(new_gallery)
@@ -108,7 +104,6 @@ async def process_pending_gallery(gallery_id: int) -> None:
             gallery.tags = data["tags"]
             gallery.local_images = data["local_images"]
 
-            # Calculate actual schedule slot only after successful download
             schedule_time = await get_next_available_slot()
             gallery.scheduled_for = schedule_time
             gallery.status = PostStatus.DOWNLOADED

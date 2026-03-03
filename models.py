@@ -34,15 +34,12 @@ class Gallery(Base):
         SQLEnum(PostStatus), default=PostStatus.PENDING
     )
 
-    # Timestamps
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
 
-    # Planned time (Target)
     scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
-    # Actual execution time (Result)
     posted_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -58,7 +55,4 @@ AsyncSessionLocal = async_sessionmaker(
 
 async def init_db() -> None:
     async with engine.begin() as conn:
-        # Note: Alembic is recommended for migrations in prod,
-        # but for this script, create_all handles new tables only.
-        # To add columns to existing DB without dropping, you might need to manually alter table or delete db file.
         await conn.run_sync(Base.metadata.create_all)

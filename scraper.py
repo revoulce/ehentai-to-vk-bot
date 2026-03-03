@@ -76,11 +76,9 @@ class EhentaiHarvester:
                 try:
                     logger.info(f"Processing metadata: {url}")
 
-                    # 1. Fetch Page 0 (Base URL)
                     html_p0 = await self.fetch_text(session, url)
                     sel_p0 = Selector(text=html_p0)
 
-                    # --- Metadata Extraction ---
                     title = (
                         sel_p0.css("h1#gn::text").get()
                         or sel_p0.css("h1#gj::text").get()
@@ -89,7 +87,6 @@ class EhentaiHarvester:
                         logger.error(f"Failed to extract title: {url}")
                         return None
 
-                    # Extract tags with namespaces
                     tags_data: Dict[str, List[str]] = {}
                     tag_rows = sel_p0.css("div#taglist table tr")
                     for row in tag_rows:
@@ -99,15 +96,11 @@ class EhentaiHarvester:
                             t_list = row.css("td:nth-child(2) div a::text").getall()
                             tags_data[ns] = t_list
 
-                    # Blacklist check
                     all_tags = [t for sublist in tags_data.values() for t in sublist]
                     if any(t in settings.TAG_BLACKLIST for t in all_tags):
                         logger.warning(f"Blacklisted tags in {title}")
                         return None
 
-                    # --- Global Random Selection Logic ---
-
-                    # Determine Total Images count from "Showing 1 - 20 of X images"
                     total_images = 0
                     gpc_text = sel_p0.css("p.gpc::text").get()
                     if gpc_text:
@@ -116,7 +109,6 @@ class EhentaiHarvester:
                             total_images = int(match.group(1).replace(",", ""))
 
                     if total_images == 0:
-                        # Fallback: Count images on current page
                         total_images = len(sel_p0.css("div#gdt a").getall())
                         logger.warning(
                             f"Could not parse total images count. Fallback to {total_images}"
@@ -124,13 +116,11 @@ class EhentaiHarvester:
 
                     logger.info(f"Total images in gallery: {total_images}")
 
-                    # Pick 4 unique random indices across the entire gallery
                     target_count = min(total_images, 4)
                     target_indices = set(
                         random.sample(range(total_images), target_count)
                     )
 
-                    # Map global indices to specific pages (Standard EH page size is 20)
                     PAGE_SIZE = 20
                     pages_to_fetch: Dict[int, Set[int]] = {}
 
@@ -141,28 +131,22 @@ class EhentaiHarvester:
                             pages_to_fetch[page_num] = set()
                         pages_to_fetch[page_num].add(local_idx)
 
-                    # Fetch required pages and extract specific image links
                     image_page_urls: List[str] = []
 
                     for page_num, local_indices in pages_to_fetch.items():
-                        # Optimization: Reuse Page 0 HTML if needed
                         if page_num == 0:
                             sel = sel_p0
                         else:
-                            # E-Hentai pagination: /?p=1 is page 2
                             page_url = f"{url}?p={page_num}"
                             logger.info(f"Fetching page {page_num}: {page_url}")
                             await asyncio.sleep(random.uniform(0.5, 1.0))
                             page_html = await self.fetch_text(session, page_url)
                             sel = Selector(text=page_html)
 
-                        # Extract all image links on this page
-                        # Universal selector for both Extended and Thumbnail views
                         raw_links = sel.css(
                             "div#gdt a[href*='/s/']::attr(href)"
                         ).getall()
 
-                        # Deduplicate preserving order
                         unique_links = []
                         seen = set()
                         for link in raw_links:
@@ -170,7 +154,6 @@ class EhentaiHarvester:
                                 unique_links.append(link)
                                 seen.add(link)
 
-                        # Select specific images based on local index
                         for local_idx in local_indices:
                             if local_idx < len(unique_links):
                                 image_page_urls.append(unique_links[local_idx])
@@ -183,7 +166,6 @@ class EhentaiHarvester:
                         logger.error("No image links found after traversing pages.")
                         return None
 
-                    # Download the selected images
                     image_paths: List[str] = []
                     for idx, page_url in enumerate(image_page_urls):
                         await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -197,7 +179,6 @@ class EhentaiHarvester:
                                 if len(ext) > 4:
                                     ext = "jpg"
 
-                                # Hash filename to avoid collisions and ensure uniqueness
                                 fname = (
                                     hashlib.md5(
                                         f"{url}_{idx}_{random.randint(0, 1000)}".encode()
