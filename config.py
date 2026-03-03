@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     EH_COOKIES: Dict[str, str]
 
     API_HOST: str = "0.0.0.0"
-    API_PORT: int = 8080
+    API_PORT: int = 40000
     API_SECRET: SecretStr = SecretStr("change_me_in_env")
 
     DB_URL: str = "sqlite+aiosqlite:///./data/bot.db"
