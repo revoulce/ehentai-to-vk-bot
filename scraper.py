@@ -32,7 +32,8 @@ class EhentaiHarvester:
         return {
             "headers": self.headers,
             "cookies": settings.EH_COOKIES,
-            "timeout": ClientTimeout(total=45, connect=10, sock_read=30),
+            # Увеличенный таймаут для загрузки до 13 изображений
+            "timeout": ClientTimeout(total=120, connect=10, sock_read=30),
             "trust_env": True,
         }
 
@@ -96,7 +97,7 @@ class EhentaiHarvester:
                             t_list = row.css("td:nth-child(2) div a::text").getall()
                             tags_data[ns] = t_list
 
-                    all_tags =[t for sublist in tags_data.values() for t in sublist]
+                    all_tags = [t for sublist in tags_data.values() for t in sublist]
                     if any(t in settings.TAG_BLACKLIST for t in all_tags):
                         logger.warning(f"Blacklisted tags in {title}")
                         return None
@@ -108,7 +109,11 @@ class EhentaiHarvester:
                         if match:
                             total_images = int(match.group(1).replace(",", ""))
 
-                    page_0_links = list(dict.fromkeys(sel_p0.css("div#gdt a[href*='/s/']::attr(href)").getall()))
+                    page_0_links = list(
+                        dict.fromkeys(
+                            sel_p0.css("div#gdt a[href*='/s/']::attr(href)").getall()
+                        )
+                    )
                     page_size = len(page_0_links)
 
                     if page_size == 0:
@@ -120,7 +125,8 @@ class EhentaiHarvester:
 
                     logger.info(f"Total images: {total_images}, Page size: {page_size}")
 
-                    target_count = min(total_images, 4)
+                    # 13: 4 на основной паблик + 9 на донат (если в галерее есть столько)
+                    target_count = min(total_images, 13)
                     target_indices = set(
                         random.sample(range(total_images), target_count)
                     )
@@ -133,7 +139,7 @@ class EhentaiHarvester:
                             pages_to_fetch[page_num] = set()
                         pages_to_fetch[page_num].add(local_idx)
 
-                    image_page_urls: List[str] =[]
+                    image_page_urls: List[str] = []
                     for page_num, local_indices in pages_to_fetch.items():
                         if page_num == 0:
                             sel = sel_p0
@@ -144,7 +150,11 @@ class EhentaiHarvester:
                             page_html = await self.fetch_text(session, page_url)
                             sel = Selector(text=page_html)
 
-                        unique_links = list(dict.fromkeys(sel.css("div#gdt a[href*='/s/']::attr(href)").getall()))
+                        unique_links = list(
+                            dict.fromkeys(
+                                sel.css("div#gdt a[href*='/s/']::attr(href)").getall()
+                            )
+                        )
 
                         for local_idx in local_indices:
                             if local_idx < len(unique_links):
@@ -158,7 +168,7 @@ class EhentaiHarvester:
                         logger.error("No image links found after traversing pages.")
                         return None
 
-                    image_paths: List[str] =[]
+                    image_paths: List[str] = []
                     for idx, page_url in enumerate(image_page_urls):
                         await asyncio.sleep(random.uniform(1.0, 2.0))
                         try:

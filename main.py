@@ -182,22 +182,36 @@ async def uploader_loop() -> None:
                         target_time = new_time
                         logger.info(f"Rescheduled to {new_time}")
 
+                    all_images = list(gallery.local_images)
+                    random.shuffle(all_images)
+
+                    public_images = all_images[:4]
+                    donut_images = all_images[4:13]
+
                     publisher = VkPublisher()
                     message = generate_caption(gallery)
-
-                    all_images = gallery.local_images
-                    selected_images = random.sample(all_images, min(len(all_images), 4))
-
-                    attachments = await publisher.upload_photos(selected_images)
                     unix_time = int(target_time.timestamp())
 
-                    post_id = await publisher.publish(
-                        message, attachments, publish_date=unix_time
-                    )
+                    if public_images:
+                        attachments = await publisher.upload_photos(public_images)
+                        post_id = await publisher.publish(
+                            message, attachments, publish_date=unix_time
+                        )
+                        gallery.vk_post_id = post_id
+
+                    if donut_images:
+                        donut_msg = f"{message}\n\n⭐ Эксклюзивное продолжение для Донов"
+                        donut_attachments = await publisher.upload_photos(donut_images)
+                        if donut_attachments:
+                            await publisher.publish(
+                                donut_msg,
+                                donut_attachments,
+                                publish_date=unix_time + 60,
+                                is_donut=True
+                            )
 
                     gallery.status = PostStatus.POSTED
                     gallery.posted_at = datetime.now(timezone.utc)
-                    gallery.vk_post_id = post_id
                     await session.commit()
 
                     logger.success(f"Scheduled in VK: {gallery.title}")

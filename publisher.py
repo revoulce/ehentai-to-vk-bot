@@ -42,45 +42,59 @@ class VkPublisher:
         if not file_paths:
             return []
 
-        server_data = await self._request(
-            "photos.getWallUploadServer", {"group_id": self.group_id}
-        )
-        upload_url = server_data["upload_url"]
+        attachments = []
 
-        data = aiohttp.FormData()
-        opened_files = []
-        try:
-            for i, path in enumerate(file_paths[:5], start=1):
-                f = open(path, "rb")
-                opened_files.append(f)
-                data.add_field(f"photo{i}", f, filename=f"img{i}.jpg")
+        # Загрузка батчами до 5 фото за раз (лимит VK API)
+        for i in range(0, len(file_paths), 5):
+            chunk = file_paths[i : i + 5]
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(upload_url, data=data) as upload_resp:
-                    upload_result = await upload_resp.json()
-        finally:
-            for f in opened_files:
-                f.close()
+            server_data = await self._request(
+                "photos.getWallUploadServer", {"group_id": self.group_id}
+            )
+            upload_url = server_data["upload_url"]
 
-        if (
-            not upload_result
-            or not upload_result.get("photo")
-            or upload_result.get("photo") == "[]"
-        ):
-            return []
+            data = aiohttp.FormData()
+            opened_files = []
+            try:
+                for j, path in enumerate(chunk, start=1):
+                    f = open(path, "rb")
+                    opened_files.append(f)
+                    data.add_field(f"photo{j}", f, filename=f"img{j}.jpg")
 
-        save_params = {
-            "group_id": self.group_id,
-            "photo": upload_result["photo"],
-            "server": upload_result["server"],
-            "hash": upload_result["hash"],
-        }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(upload_url, data=data) as upload_resp:
+                        upload_result = await upload_resp.json()
+            finally:
+                for f in opened_files:
+                    f.close()
 
-        saved_photos = await self._request("photos.saveWallPhoto", save_params)
-        return [f"photo{p['owner_id']}_{p['id']}" for p in saved_photos]
+            if (
+                not upload_result
+                or not upload_result.get("photo")
+                or upload_result.get("photo") == "[]"
+            ):
+                continue
+
+            save_params = {
+                "group_id": self.group_id,
+                "photo": upload_result["photo"],
+                "server": upload_result["server"],
+                "hash": upload_result["hash"],
+            }
+
+            saved_photos = await self._request("photos.saveWallPhoto", save_params)
+            attachments.extend(
+                [f"photo{p['owner_id']}_{p['id']}" for p in saved_photos]
+            )
+
+        return attachments
 
     async def publish(
-        self, message: str, attachments: list[str], publish_date: Optional[int] = None
+        self,
+        message: str,
+        attachments: list[str],
+        publish_date: Optional[int] = None,
+        is_donut: bool = False,
     ) -> int:
         params = {
             "owner_id": -self.group_id,
@@ -93,7 +107,12 @@ class VkPublisher:
         if publish_date:
             params["publish_date"] = publish_date
 
+        if is_donut:
+            params["donut_paid_duration"] = -1
+
         response = await self._request("wall.post", params)
         post_id = response.get("post_id")
-        logger.info(f"Published (Scheduled: {bool(publish_date)}). Post ID: {post_id}")
+        logger.info(
+            f"Published (Scheduled: {bool(publish_date)}, Donut: {is_donut}). Post ID: {post_id}"
+        )
         return post_id
