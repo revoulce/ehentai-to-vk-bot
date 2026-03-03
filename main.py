@@ -194,6 +194,9 @@ async def uploader_loop() -> None:
 
                     if public_images:
                         attachments = await publisher.upload_photos(public_images)
+                        if not attachments:
+                            raise Exception("VK rejected all images. Attachments list is empty.")
+
                         post_id = await publisher.publish(
                             message, attachments, publish_date=unix_time
                         )
@@ -203,12 +206,15 @@ async def uploader_loop() -> None:
                         donut_msg = f"{message}\n\n⭐ Эксклюзивное продолжение для Донов"
                         donut_attachments = await publisher.upload_photos(donut_images)
                         if donut_attachments:
-                            await publisher.publish(
-                                donut_msg,
-                                donut_attachments,
-                                publish_date=unix_time + 60,
-                                is_donut=True
-                            )
+                            try:
+                                await publisher.publish(
+                                    donut_msg,
+                                    donut_attachments,
+                                    publish_date=unix_time + 60,
+                                    is_donut=True
+                                )
+                            except Exception as donut_err:
+                                logger.error(f"Donut post failed (VK Donut enabled in group?): {donut_err}")
 
                     gallery.status = PostStatus.POSTED
                     gallery.posted_at = datetime.now(timezone.utc)

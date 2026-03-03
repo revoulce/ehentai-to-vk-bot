@@ -44,7 +44,6 @@ class VkPublisher:
 
         attachments = []
 
-        # Загрузка батчами до 5 фото за раз (лимит VK API)
         for i in range(0, len(file_paths), 5):
             chunk = file_paths[i : i + 5]
 
@@ -59,7 +58,10 @@ class VkPublisher:
                 for j, path in enumerate(chunk, start=1):
                     f = open(path, "rb")
                     opened_files.append(f)
-                    data.add_field(f"photo{j}", f, filename=f"img{j}.jpg")
+                    # ВАЖНО: VK требует строго имена file1, file2 ... file5
+                    data.add_field(
+                        f"file{j}", f, filename=f"img{j}.jpg", content_type="image/jpeg"
+                    )
 
                 async with aiohttp.ClientSession() as session:
                     async with session.post(upload_url, data=data) as upload_resp:
@@ -73,6 +75,7 @@ class VkPublisher:
                 or not upload_result.get("photo")
                 or upload_result.get("photo") == "[]"
             ):
+                logger.warning(f"Empty VK upload result for chunk: {upload_result}")
                 continue
 
             save_params = {
