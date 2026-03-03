@@ -43,52 +43,48 @@ class VkPublisher:
             return []
 
         attachments = []
-
-        for i in range(0, len(file_paths), 5):
-            chunk = file_paths[i : i + 5]
-
-            server_data = await self._request(
-                "photos.getWallUploadServer", {"group_id": self.group_id}
-            )
-            upload_url = server_data["upload_url"]
-
-            data = aiohttp.FormData()
-            opened_files = []
-            try:
-                for j, path in enumerate(chunk, start=1):
-                    f = open(path, "rb")
-                    opened_files.append(f)
-                    # ВАЖНО: VK требует строго имена file1, file2 ... file5
-                    data.add_field(
-                        f"file{j}", f, filename=f"img{j}.jpg", content_type="image/jpeg"
+        async with aiohttp.ClientSession() as session:
+            for path in file_paths:
+                try:
+                    server_data = await self._request(
+                        "photos.getWallUploadServer", {"group_id": self.group_id}
                     )
+                    upload_url = server_data["upload_url"]
 
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(upload_url, data=data) as upload_resp:
-                        upload_result = await upload_resp.json()
-            finally:
-                for f in opened_files:
-                    f.close()
+                    with open(path, "rb") as f:
+                        data = aiohttp.FormData()
+                        data.add_field(
+                            "photo", f, filename="img.jpg", content_type="image/jpeg"
+                        )
+                        async with session.post(upload_url, data=data) as upload_resp:
+                            upload_result = await upload_resp.json()
 
-            if (
-                not upload_result
-                or not upload_result.get("photo")
-                or upload_result.get("photo") == "[]"
-            ):
-                logger.warning(f"Empty VK upload result for chunk: {upload_result}")
-                continue
+                    if (
+                        not upload_result
+                        or not upload_result.get("photo")
+                        or upload_result.get("photo") == "[]"
+                    ):
+                        logger.warning(
+                            f"Empty VK upload result for {path}: {upload_result}"
+                        )
+                        continue
 
-            save_params = {
-                "group_id": self.group_id,
-                "photo": upload_result["photo"],
-                "server": upload_result["server"],
-                "hash": upload_result["hash"],
-            }
+                    save_params = {
+                        "group_id": self.group_id,
+                        "photo": upload_result["photo"],
+                        "server": upload_result["server"],
+                        "hash": upload_result["hash"],
+                    }
 
-            saved_photos = await self._request("photos.saveWallPhoto", save_params)
-            attachments.extend(
-                [f"photo{p['owner_id']}_{p['id']}" for p in saved_photos]
-            )
+                    saved_photos = await self._request(
+                        "photos.saveWallPhoto", save_params
+                    )
+                    if saved_photos:
+                        p = saved_photos[0]
+                        attachments.append(f"photo{p['owner_id']}_{p['id']}")
+                except Exception as e:
+                    logger.error(f"Image processing error {path}: {e}")
+                    continue
 
         return attachments
 
