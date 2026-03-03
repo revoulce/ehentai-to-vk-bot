@@ -13,7 +13,7 @@ class ServiceError(Exception):
 def generate_caption(gallery: Gallery) -> str:
     """Constructs the VK post body from gallery metadata."""
     tags_dict = gallery.tags
-    lines = [gallery.title, ""]
+    lines = []
 
     def add_group(label: str, key: str) -> None:
         if key in tags_dict and tags_dict[key]:
@@ -23,7 +23,7 @@ def generate_caption(gallery: Gallery) -> str:
 
     add_group("Фэндом", "parody")
     add_group("Персонаж", "character")
-    add_group("Модель", "cosplayer")
+    # add_group("Модель", "cosplayer")
 
     return "\n".join(lines)
 

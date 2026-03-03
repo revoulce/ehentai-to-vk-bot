@@ -23,20 +23,14 @@ from services import (
     ServiceError,
 )
 
-
-# --- Logging Setup ---
-class AccessLogger(logging.Logger):
-    """Mute aiohttp access logs to keep console clean"""
-
-    def info(self, msg, *args, **kwargs):
-        pass
+# --- Logging Configuration ---
 
 
-# Intercept standard logging to filter out aiohttp noise
-class AiohttpFilter(logging.Filter):
+# Filter to suppress "BadHttpMessage" (Scanner noise) from aiohttp.server
+class AiohttpScannerFilter(logging.Filter):
     def filter(self, record):
-        # Filter out "Pause on PRI/Upgrade" and other scanner noise
         msg = record.getMessage()
+        # Suppress "Pause on PRI" and "BadHttpMessage" errors caused by port scanners
         if "BadHttpMessage" in msg or "Pause on PRI" in msg:
             return False
         return True
@@ -47,8 +41,8 @@ logger.remove()
 logger.add(sys.stderr, level="INFO")
 logger.add("bot.log", rotation="10 MB", level="DEBUG", compression="zip")
 
-# Apply filter to standard logging (used by aiohttp internals)
-logging.getLogger("aiohttp.server").addFilter(AiohttpFilter())
+# Apply filter to standard python logging used by aiohttp
+logging.getLogger("aiohttp.server").addFilter(AiohttpScannerFilter())
 
 # --- Middleware ---
 
@@ -81,28 +75,29 @@ async def security_middleware(
     request: web.Request, handler: Callable[[web.Request], Awaitable[web.Response]]
 ) -> web.Response:
     """
-    Global security check.
-    If the user is unauthorized or trying to access wrong paths, send them away.
+    Blocks unauthorized access with a custom message.
     """
-    # Allow CORS preflight
+    # Allow CORS preflight (OPTIONS) without auth
     if request.method == "OPTIONS":
         return await handler(request)
 
-    # Check Authorization
     auth_header = request.headers.get("Authorization")
     expected_auth = f"Bearer {settings.API_SECRET.get_secret_value()}"
 
     if auth_header != expected_auth:
+        # Log warning with IP
         logger.warning(f"Unauthorized access attempt from {request.remote}")
-        # The specific response requested by user
-        return web.Response(text="Go fuck yourself.", status=401)
+        # Explicit rejection
+        return web.Response(text="Иди нахуй.", status=401)
 
     return await handler(request)
 
 
 # --- API Handlers ---
+
+
 async def api_queue_handler(request: web.Request) -> web.Response:
-    # Auth is already handled by middleware
+    # Auth is handled by security_middleware
     try:
         data = await request.json()
         url = data.get("url")
@@ -123,11 +118,12 @@ async def api_queue_handler(request: web.Request) -> web.Response:
 
 
 async def start_api_server() -> None:
-    # Order matters: CORS first, then Security
+    # Middleware order: CORS first (to handle OPTIONS), then Security (to block others)
     app = web.Application(middlewares=[cors_middleware, security_middleware])
     app.router.add_post("/api/queue", api_queue_handler)
 
-    runner = web.AppRunner(app, access_log_class=AccessLogger)
+    # access_log=None disables the "200 OK" spam in console
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
 
     site = web.TCPSite(runner, "0.0.0.0", settings.API_PORT)
@@ -174,7 +170,6 @@ async def downloader_loop() -> None:
                 await asyncio.sleep(5)
             else:
                 await asyncio.sleep(10)
-
         except Exception as e:
             logger.exception(f"Downloader crash: {e}")
             await asyncio.sleep(10)
