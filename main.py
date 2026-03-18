@@ -1,27 +1,26 @@
 import asyncio
-import sys
-import random
 import logging
-from pathlib import Path
+import random
+import sys
 from datetime import datetime, timezone
-from typing import Callable, Awaitable
+from pathlib import Path
+from typing import Awaitable, Callable
 
 from aiohttp import web
-from sqlalchemy import select
 from loguru import logger
+from sqlalchemy import select
 
 from config import settings
-from models import init_db, AsyncSessionLocal, Gallery, PostStatus
+from models import AsyncSessionLocal, Gallery, PostStatus, init_db
 from publisher import VkPublisher
-from tg_bot import start_bot
 from services import (
-    queue_gallery,
-    process_pending_gallery,
+    ServiceError,
     generate_caption,
     get_next_available_slot,
-    ServiceError,
+    process_pending_gallery,
+    queue_gallery,
 )
-
+from tg_bot import start_bot
 
 
 class AiohttpScannerFilter(logging.Filter):
@@ -40,7 +39,7 @@ logging.getLogger("aiohttp.server").addFilter(AiohttpScannerFilter())
 
 @web.middleware
 async def cors_middleware(
-    request: web.Request, handler: Callable[[web.Request], Awaitable[web.Response]]
+        request: web.Request, handler: Callable[[web.Request], Awaitable[web.Response]]
 ) -> web.Response:
     if request.method == "OPTIONS":
         response = web.Response()
@@ -63,11 +62,8 @@ async def cors_middleware(
 
 @web.middleware
 async def security_middleware(
-    request: web.Request, handler: Callable[[web.Request], Awaitable[web.Response]]
+        request: web.Request, handler: Callable[[web.Request], Awaitable[web.Response]]
 ) -> web.Response:
-    """
-    Blocks unauthorized access with a custom message.
-    """
     if request.method == "OPTIONS":
         return await handler(request)
 
@@ -76,7 +72,7 @@ async def security_middleware(
 
     if auth_header != expected_auth:
         logger.warning(f"Unauthorized access attempt from {request.remote}")
-        return web.Response(text="Иди нахуй.", status=401)
+        return web.Response(status=401)
 
     return await handler(request)
 
@@ -88,8 +84,10 @@ async def api_queue_handler(request: web.Request) -> web.Response:
         if not url:
             return web.json_response({"error": "Missing URL"}, status=400)
 
-        result = await queue_gallery(url)
-        logger.info(f"API Queued: {url}")
+        include_cosplayer = bool(data.get("include_cosplayer", False))
+
+        result = await queue_gallery(url, include_cosplayer=include_cosplayer)
+        logger.info(f"API Queued: {url} (cosplayer={include_cosplayer})")
         return web.json_response({"status": "success", "message": result})
 
     except ServiceError as e:
@@ -182,42 +180,25 @@ async def uploader_loop() -> None:
                         target_time = new_time
                         logger.info(f"Rescheduled to {new_time}")
 
-                    all_images = list(gallery.local_images)
-                    random.shuffle(all_images)
-
-                    public_images = all_images[:4]
-                    donut_images = all_images[4:13]
-
                     publisher = VkPublisher()
-                    message = generate_caption(gallery)
+
+                    message = generate_caption(
+                        gallery, include_cosplayer=gallery.include_cosplayer
+                    )
+
+                    all_images = gallery.local_images
+                    selected_images = random.sample(all_images, min(len(all_images), 4))
+
+                    attachments = await publisher.upload_photos(selected_images)
                     unix_time = int(target_time.timestamp())
 
-                    if public_images:
-                        attachments = await publisher.upload_photos(public_images)
-                        if not attachments:
-                            raise Exception("VK rejected all images. Attachments list is empty.")
-
-                        post_id = await publisher.publish(
-                            message, attachments, publish_date=unix_time
-                        )
-                        gallery.vk_post_id = post_id
-
-                    if donut_images:
-                        donut_msg = f"{message}\n\n⭐ Эксклюзивное продолжение для Донов"
-                        donut_attachments = await publisher.upload_photos(donut_images)
-                        if donut_attachments:
-                            try:
-                                await publisher.publish(
-                                    donut_msg,
-                                    donut_attachments,
-                                    publish_date=unix_time + 60,
-                                    is_donut=True
-                                )
-                            except Exception as donut_err:
-                                logger.error(f"Donut post failed (VK Donut enabled in group?): {donut_err}")
+                    post_id = await publisher.publish(
+                        message, attachments, publish_date=unix_time
+                    )
 
                     gallery.status = PostStatus.POSTED
                     gallery.posted_at = datetime.now(timezone.utc)
+                    gallery.vk_post_id = post_id
                     await session.commit()
 
                     logger.success(f"Scheduled in VK: {gallery.title}")
