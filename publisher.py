@@ -43,24 +43,30 @@ class VkPublisher:
             return []
 
         attachments = []
-        server_data = await self._request(
-            "photos.getWallUploadServer", {"group_id": self.group_id}
-        )
-        upload_url = server_data["upload_url"]
-
         async with aiohttp.ClientSession() as session:
             for path in file_paths:
                 try:
+                    server_data = await self._request(
+                        "photos.getWallUploadServer", {"group_id": self.group_id}
+                    )
+                    upload_url = server_data["upload_url"]
+
                     with open(path, "rb") as f:
                         data = aiohttp.FormData()
-                        data.add_field("photo", f, filename="img.jpg")
+                        data.add_field(
+                            "photo", f, filename="img.jpg", content_type="image/jpeg"
+                        )
                         async with session.post(upload_url, data=data) as upload_resp:
                             upload_result = await upload_resp.json()
 
                     if (
-                        not upload_result.get("photo")
+                        not upload_result
+                        or not upload_result.get("photo")
                         or upload_result.get("photo") == "[]"
                     ):
+                        logger.warning(
+                            f"Empty VK upload result for {path}: {upload_result}"
+                        )
                         continue
 
                     save_params = {
@@ -69,6 +75,7 @@ class VkPublisher:
                         "server": upload_result["server"],
                         "hash": upload_result["hash"],
                     }
+
                     saved_photos = await self._request(
                         "photos.saveWallPhoto", save_params
                     )
@@ -78,10 +85,15 @@ class VkPublisher:
                 except Exception as e:
                     logger.error(f"Image processing error {path}: {e}")
                     continue
+
         return attachments
 
     async def publish(
-        self, message: str, attachments: list[str], publish_date: Optional[int] = None
+        self,
+        message: str,
+        attachments: list[str],
+        publish_date: Optional[int] = None,
+        is_donut: bool = False,
     ) -> int:
         params = {
             "owner_id": -self.group_id,
@@ -91,11 +103,15 @@ class VkPublisher:
             "primary_attachments_mode": "grid",
         }
 
-        # Add scheduling if provided
         if publish_date:
             params["publish_date"] = publish_date
 
+        if is_donut:
+            params["donut_paid_duration"] = -1
+
         response = await self._request("wall.post", params)
         post_id = response.get("post_id")
-        logger.info(f"Published (Scheduled: {bool(publish_date)}). Post ID: {post_id}")
+        logger.info(
+            f"Published (Scheduled: {bool(publish_date)}, Donut: {is_donut}). Post ID: {post_id}"
+        )
         return post_id

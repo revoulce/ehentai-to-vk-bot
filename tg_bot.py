@@ -43,7 +43,6 @@ async def cmd_add(message: Message) -> None:
 
     results = []
     for url in urls:
-        # Extract ID/Token for brevity in logs
         short_name = url.split("/")[-3] if len(url.split("/")) > 3 else "Gallery"
         try:
             res = await queue_gallery(url)
@@ -53,7 +52,6 @@ async def cmd_add(message: Message) -> None:
         except Exception:
             results.append(f"[ERR] {short_name}: System Error")
 
-    # Split long messages if necessary
     response_text = "\n".join(results)
     if len(response_text) > 4000:
         response_text = response_text[:4000] + "..."
