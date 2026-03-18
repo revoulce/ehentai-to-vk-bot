@@ -2,7 +2,7 @@ import enum
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import JSON, Boolean, DateTime, Integer, String
+from sqlalchemy import JSON, DateTime, Integer, String
 from sqlalchemy import Enum as SQLEnum
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -27,14 +27,12 @@ class Gallery(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     source_url: Mapped[str] = mapped_column(String, unique=True, index=True)
     title: Mapped[str] = mapped_column(String)
-    tags: Mapped[List[str]] = mapped_column(JSON)
+    tags: Mapped[List[str]] = mapped_column(JSON)  # Dict stored as JSON
     local_images: Mapped[List[str]] = mapped_column(JSON, default=list)
 
     status: Mapped[PostStatus] = mapped_column(
         SQLEnum(PostStatus), default=PostStatus.PENDING
     )
-
-    include_cosplayer: Mapped[bool] = mapped_column(Boolean, default=False)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
