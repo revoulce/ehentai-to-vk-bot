@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     DB_URL: str = "sqlite+aiosqlite:///./data/bot.db"
     STORAGE_PATH: Path = Path("./downloads")
-    SCHEDULE_INTERVAL_MINUTES: int = 60
+    SCHEDULE_INTERVAL_HOURS: int = 1
 
     TAG_BLACKLIST: Set[str] = {
         "guro",

@@ -54,8 +54,8 @@ ADMIN_IDS=[12345678, 87654321]
 EH_COOKIES='{"ipb_member_id": "12345", "ipb_pass_hash": "abcdef..."}'
 
 # --- System ---
-# Minimum interval between posts (minutes)
-SCHEDULE_INTERVAL_MINUTES=60
+# Minimum interval between posts (hours)
+SCHEDULE_INTERVAL_HOURS=1
 
 # Galleries containing these tags will be rejected immediately
 TAG_BLACKLIST='["guro", "scat", "furry", "bestiality"]'

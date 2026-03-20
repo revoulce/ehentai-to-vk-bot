@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 
+from config import settings
 from models import AsyncSessionLocal, Gallery, PostStatus
 from scraper import EhentaiHarvester
 from utils import process_tags
@@ -50,14 +51,19 @@ async def get_next_available_slot(from_time: datetime | None = None) -> datetime
     else:
         base_time = max(last_db_time, now_utc) if last_db_time else now_utc
 
-    next_hour = base_time.replace(minute=0, second=0, microsecond=0) + timedelta(
-        hours=1
+    interval = settings.SCHEDULE_INTERVAL_HOURS
+
+    base_floor = base_time.replace(minute=0, second=0, microsecond=0)
+    slots_passed = base_floor.hour // interval
+
+    next_slot = base_floor.replace(hour=0) + timedelta(
+        hours=(slots_passed + 1) * interval
     )
 
-    if (next_hour - now_utc).total_seconds() < 300:
-        next_hour += timedelta(hours=1)
+    if (next_slot - now_utc).total_seconds() < 300:
+        next_slot += timedelta(hours=interval)
 
-    return next_hour
+    return next_slot
 
 
 async def queue_gallery(url: str, include_cosplayer: bool = False) -> str:
