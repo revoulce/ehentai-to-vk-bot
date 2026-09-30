@@ -33,7 +33,7 @@ async def cmd_add(message: Message) -> None:
         return
 
     entities = message.text.split()
-    urls = [w for w in entities if ("e-hentai.org/g/" in w or "exhentai.org/g/" in w)]
+    urls = entities[1:]
 
     if not urls:
         await message.answer("Usage: /add &lt;url&gt;")
@@ -47,7 +47,7 @@ async def cmd_add(message: Message) -> None:
         try:
             res = await queue_gallery(url)
             results.append(f"[OK] {short_name}: {res}")
-        except ServiceError as e:
+        except (ServiceError, ValueError) as e:
             results.append(f"[WARN] {short_name}: {str(e)}")
         except Exception:
             results.append(f"[ERR] {short_name}: System Error")
@@ -56,7 +56,7 @@ async def cmd_add(message: Message) -> None:
     if len(response_text) > 4000:
         response_text = response_text[:4000] + "..."
 
-    await message.answer(response_text)
+    await message.answer(html.escape(response_text))
 
 
 async def start_bot() -> None:
@@ -67,5 +67,8 @@ async def start_bot() -> None:
     dp = Dispatcher()
     dp.include_router(router)
 
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()

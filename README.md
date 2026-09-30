@@ -1,96 +1,91 @@
 # E-Hentai to VK Content Pipeline
 
-Asynchronous service for scraping gallery metadata/images from E-Hentai and scheduling posts to a VKontakte community wall.
+Asynchronous service that downloads gallery images and schedules posts to a VK community. Galleries can be queued from Telegram or the companion browser extension.
 
 ## Architecture
 
-- **Core:** Python 3.14 (AsyncIO)
-- **Network:** Aiohttp + Tenacity (Retries/Backoff)
-- **Parsing:** Parsel (XPath/CSS Selectors)
-- **Database:** SQLite + SQLAlchemy 2.0 (Async)
-- **Interface:** Aiogram 3.x (Telegram Bot)
-- **Deployment:** Docker Compose
+- Python 3.12+ (Docker uses Python 3.13), aiohttp, SQLAlchemy/SQLite, aiogram.
+- `main.py`: logging, startup and shutdown of the four concurrent tasks.
+- `api.py`: authenticated HTTP API and request validation.
+- `services.py`: queue operations, captions and gallery processing.
+- `scheduling.py`: UTC schedule calculation with a five-minute buffer.
+- `workers.py`: downloader and VK uploader loops.
+- `scraper.py`: metadata parsing and image downloads.
+- `publisher.py`: VK API calls with a shared HTTP session and per-photo network retries.
+- `storage.py`: local file cleanup.
 
-## Features
-
-1.  **Scraping:** Extracts title, tags (namespaces: parody, character, cosplayer), and downloads images.
-2.  **Processing:**
-    -   Random selection of 4 images per gallery for the grid layout.
-    -   Tag cleaning (strips special chars, handles composite tags).
-    -   Deduplication based on source URL.
-3.  **Scheduling:**
-    -   Calculates the next available round hour slot (e.g., 14:00, 15:00).
-    -   Uses VK Native Scheduling (`publish_date`).
-    -   Auto-rescheduling if the target slot passes during processing.
-4.  **Lifecycle:** Auto-deletes local files after successful API handoff.
-
-## Prerequisites
-
-- **Docker Engine** & **Docker Compose**.
-- **VK Account** with Admin rights to the target group.
-- **E-Hentai Cookies** (Required for access to specific galleries/original images).
+One downloader and one uploader run per process. Run a single bot instance against a database; the queue does not implement distributed worker claims.
 
 ## Configuration
 
-Create a `.env` file in the project root:
+Copy `.env.example` to `.env` and replace the sample values:
 
 ```ini
-# --- VK Configuration ---
-# CRITICAL: Use a USER Token (Kate Mobile/VK Admin app), NOT a Community Token.
-# Community tokens cannot post to the wall with 'from_group=1' and attachments.
-# Scope required: wall, photos, groups, offline.
-VK_ACCESS_TOKEN=vk1.a.YOUR_USER_TOKEN_HERE
-
-# Target Community ID (Positive integer)
+VK_ACCESS_TOKEN=your-vk-user-token
 VK_GROUP_ID=123456789
-
-# --- Telegram Configuration ---
-TG_BOT_TOKEN=123456:ABC-DEF...
-# List of Admin IDs allowed to control the bot
-ADMIN_IDS=[12345678, 87654321]
-
-# --- E-Hentai Configuration ---
-# JSON format required. Copy from browser DevTools -> Application -> Cookies.
-EH_COOKIES='{"ipb_member_id": "12345", "ipb_pass_hash": "abcdef..."}'
-
-# --- System ---
-# Minimum interval between posts (hours)
+TG_BOT_TOKEN=123456:your-telegram-token
+ADMIN_IDS=[12345678]
+EH_COOKIES={"ipb_member_id":"12345","ipb_pass_hash":"your-cookie"}
+API_SECRET=your-long-random-secret
+API_HOST=0.0.0.0
+API_PORT=45000
 SCHEDULE_INTERVAL_HOURS=1
-
-# Galleries containing these tags will be rejected immediately
-TAG_BLACKLIST='["guro", "scat", "furry", "bestiality"]'
 ```
+
+Use a VK user token with permission to manage the target community and upload photos. `VK_GROUP_ID` must be positive, `API_SECRET` is required, and `SCHEDULE_INTERVAL_HOURS` must be at least 1.
+
+The default blacklist is `guro`, `scat`, `furry`, `lolicon`, `shotacon`, `bestiality`. Override it with a JSON array in `TAG_BLACKLIST` if needed.
+
+The SQLite database defaults to `./data/bot.db` and downloads to `./downloads`; the bot creates these directories at startup. Override `DB_URL` and `STORAGE_PATH` for other paths.
 
 ## Deployment
 
-Build and run the container:
-
-```Bash
+```sh
 docker compose up -d --build
+docker compose logs -f
 ```
 
-Check logs:
+Compose exposes port **45000** and explicitly sets the container API host/port. Set the extension API endpoint to `http://localhost:45000/api/queue` for a local deployment, or to your bot's reachable endpoint. Enter the same `API_SECRET` in the extension settings. Existing saved extension settings are preserved; update an old endpoint manually.
 
-```Bash
-docker compose logs -f
+For local development:
+
+```sh
+python -m venv .venv
+# Windows: .venv\Scripts\Activate.ps1
+# Linux/macOS: source .venv/bin/activate
+python -m pip install -r requirements.txt
+python main.py
 ```
 
 ## Usage
 
-Interact via the Telegram Bot (only responds to ADMIN_IDS).
+Telegram commands are restricted to `ADMIN_IDS`:
 
-- `/add <url>`
-<br> Queues a gallery. The bot will:
-    - Check for duplicates.
-    - Scrape metadata and download images.
-    - Calculate the next schedule slot.
-    - Upload to VK and schedule the post.
-    - Delete local files.
-- `/status`
-<br> Shows the count of galleries pending upload to VK.
+- `/add <url> [url2] ...`: enqueue galleries.
+- `/status`: show pending, ready and failed counts.
 
-## Troubleshooting
+`POST /api/queue` accepts JSON and requires `Authorization: Bearer <API_SECRET>`:
 
-- **VK API Error 100 (invalid publish_date):** The worker loop automatically handles this by rescheduling the post to the next available future slot.
-- **VK API Error 27 (Group auth failed):** You are using a Community Token. Switch to a User Token in `.env`.
-- **Database Schema Changes:** If you modify `models.py`, delete `data/bot.db` before restarting, as no migration system is included in this MVP.
+```json
+{"url":"https://e-hentai.org/g/123/abcdef/","include_cosplayer":false}
+```
+
+Only E-Hentai and ExHentai gallery URLs are accepted. URLs are normalized to HTTPS without query parameters or fragments before insertion. Concurrent duplicate submissions return HTTP 409. Malformed input returns 400, invalid credentials 401, and internal errors 500.
+
+The worker selects up to 13 images: up to 4 for the public post and up to 9 for the Donut continuation. It schedules posts at whole UTC hours, with the configured minimum spacing, and checks the five-minute buffer again after uploading photos. The public post ID and image order are saved before the optional Donut operation. Donut failures are logged and do not retry the public post. Local images are removed once processing is complete.
+
+## Verification
+
+```sh
+python -m unittest discover -s tests -v
+python -m pip install black
+python -m black --check *.py tests
+```
+
+Tests use temporary SQLite databases and mocked HTTP/VK responses; they never publish posts. Browser extension checks are documented in its own README.
+
+## Operational limits
+
+- The VK request and SQLite commit cannot be atomic. A process crash or lost VK response between creating a post and saving its ID can still cause a duplicate on retry. Donut delivery is best effort.
+- Records queued before URL normalization retain their existing source URLs. A legacy URL with query parameters may not match a newly normalized submission.
+- Database schema changes require migrations; startup only creates missing tables. This refactor does not change the table schema and does not require deleting the existing database.

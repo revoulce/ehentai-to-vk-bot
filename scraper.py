@@ -1,15 +1,15 @@
 import asyncio
-import hashlib
 import random
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, TypedDict
+from urllib.parse import urljoin, urlsplit
+from uuid import uuid4
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
 from loguru import logger
 from parsel import Selector
 from tenacity import (
-    before_sleep_log,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
@@ -17,18 +17,26 @@ from tenacity import (
 )
 
 from config import settings
+from utils import normalize_gallery_url
+
+
+class GalleryData(TypedDict):
+    title: str
+    source_url: str
+    tags: dict[str, list[str]]
+    local_images: list[str]
 
 
 class EhentaiHarvester:
     def __init__(self) -> None:
-        self.headers: Dict[str, str] = {
+        self.headers: dict[str, str] = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Referer": "https://e-hentai.org/",
         }
         self.sem = asyncio.Semaphore(2)
 
-    def _get_session_kwargs(self) -> Dict[str, Any]:
+    def _get_session_kwargs(self) -> dict[str, Any]:
         return {
             "headers": self.headers,
             "cookies": settings.EH_COOKIES,
@@ -41,7 +49,10 @@ class EhentaiHarvester:
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception_type((ClientError, asyncio.TimeoutError)),
-        before_sleep=before_sleep_log(logger, "WARNING"),
+        before_sleep=lambda state: logger.warning(
+            "Retrying gallery request after attempt {}", state.attempt_number
+        ),
+        reraise=True,
     )
     async def fetch_text(self, session: ClientSession, url: str) -> str:
         async with session.get(url) as resp:
@@ -63,15 +74,24 @@ class EhentaiHarvester:
         async with session.get(url) as resp:
             resp.raise_for_status()
             content = await resp.read()
+            if not content or not resp.headers.get("Content-Type", "").startswith(
+                "image/"
+            ):
+                raise ValueError("Image server returned empty or non-image content")
             await asyncio.to_thread(self._write_file, dest, content)
             return dest
 
     @staticmethod
     def _write_file(path: Path, content: bytes) -> None:
-        with open(path, "wb") as f:
-            f.write(content)
+        temporary = path.with_suffix(path.suffix + ".part")
+        try:
+            temporary.write_bytes(content)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
-    async def parse_gallery(self, url: str) -> Optional[Dict[str, Any]]:
+    async def parse_gallery(self, url: str) -> GalleryData | None:
+        url = normalize_gallery_url(url)
         async with self.sem:
             async with ClientSession(**self._get_session_kwargs()) as session:
                 try:
@@ -88,7 +108,7 @@ class EhentaiHarvester:
                         logger.error(f"Failed to extract title: {url}")
                         return None
 
-                    tags_data: Dict[str, List[str]] = {}
+                    tags_data: dict[str, list[str]] = {}
                     tag_rows = sel_p0.css("div#taglist table tr")
                     for row in tag_rows:
                         ns = row.css("td.tc::text").get()
@@ -98,7 +118,10 @@ class EhentaiHarvester:
                             tags_data[ns] = t_list
 
                     all_tags = [t for sublist in tags_data.values() for t in sublist]
-                    if any(t in settings.TAG_BLACKLIST for t in all_tags):
+                    blacklist = {
+                        tag.strip().casefold() for tag in settings.TAG_BLACKLIST
+                    }
+                    if any(t.strip().casefold() in blacklist for t in all_tags):
                         logger.warning(f"Blacklisted tags in {title}")
                         return None
 
@@ -131,7 +154,7 @@ class EhentaiHarvester:
                         random.sample(range(total_images), target_count)
                     )
 
-                    pages_to_fetch: Dict[int, Set[int]] = {}
+                    pages_to_fetch: dict[int, set[int]] = {}
                     for global_idx in target_indices:
                         page_num = global_idx // page_size
                         local_idx = global_idx % page_size
@@ -139,7 +162,7 @@ class EhentaiHarvester:
                             pages_to_fetch[page_num] = set()
                         pages_to_fetch[page_num].add(local_idx)
 
-                    image_page_urls: List[str] = []
+                    image_page_urls: list[str] = []
                     for page_num, local_indices in pages_to_fetch.items():
                         if page_num == 0:
                             sel = sel_p0
@@ -158,7 +181,9 @@ class EhentaiHarvester:
 
                         for local_idx in local_indices:
                             if local_idx < len(unique_links):
-                                image_page_urls.append(unique_links[local_idx])
+                                image_page_urls.append(
+                                    urljoin(url, unique_links[local_idx])
+                                )
                             else:
                                 logger.error(
                                     f"Index {local_idx} out of bounds for page {page_num}"
@@ -168,8 +193,8 @@ class EhentaiHarvester:
                         logger.error("No image links found after traversing pages.")
                         return None
 
-                    image_paths: List[str] = []
-                    for idx, page_url in enumerate(image_page_urls):
+                    image_paths: list[str] = []
+                    for page_url in image_page_urls:
                         await asyncio.sleep(random.uniform(1.0, 2.0))
                         try:
                             page_html = await self.fetch_text(session, page_url)
@@ -177,16 +202,17 @@ class EhentaiHarvester:
                             img_src = page_sel.css("img#img::attr(src)").get()
 
                             if img_src:
-                                ext = img_src.split(".")[-1].split("?")[0]
-                                if len(ext) > 4:
-                                    ext = "jpg"
-
-                                fname = (
-                                    hashlib.md5(
-                                        f"{url}_{idx}_{random.randint(0, 1000)}".encode()
-                                    ).hexdigest()
-                                    + f".{ext}"
-                                )
+                                img_src = urljoin(page_url, img_src)
+                                ext = Path(urlsplit(img_src).path).suffix.lower()
+                                if ext not in {
+                                    ".jpg",
+                                    ".jpeg",
+                                    ".png",
+                                    ".gif",
+                                    ".webp",
+                                }:
+                                    ext = ".jpg"
+                                fname = f"{uuid4().hex}{ext}"
                                 local_path = settings.STORAGE_PATH / fname
 
                                 await self.download_image(session, img_src, local_path)
@@ -205,6 +231,6 @@ class EhentaiHarvester:
                         "local_images": image_paths,
                     }
 
-                except Exception as e:
+                except Exception:
                     logger.exception(f"Scraping failed for {url}")
                     return None

@@ -1,4 +1,26 @@
 import re
+from urllib.parse import urlsplit
+
+
+def normalize_gallery_url(url: str) -> str:
+    """Accept only gallery URLs and remove view parameters before deduplication."""
+    if not isinstance(url, str):
+        raise ValueError("URL must be a string")
+    try:
+        parsed = urlsplit(url.strip())
+        valid_host = (
+            parsed.hostname in {"e-hentai.org", "exhentai.org"}
+            and parsed.port in {None, 80, 443}
+            and parsed.username is None
+            and parsed.password is None
+        )
+    except ValueError as exc:
+        raise ValueError("Invalid gallery URL") from exc
+    match = re.fullmatch(r"/g/([0-9]+)/([a-fA-F0-9]+)/?", parsed.path)
+    if parsed.scheme not in {"http", "https"} or not valid_host or match is None:
+        raise ValueError("Expected an E-Hentai or ExHentai gallery URL")
+    gallery_id, token = match.groups()
+    return f"https://{parsed.hostname}/g/{int(gallery_id)}/{token.lower()}/"
 
 
 def clean_tag(tag_raw: str) -> str:
