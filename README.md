@@ -61,7 +61,7 @@ python main.py
 
 Telegram commands are restricted to `ADMIN_IDS`:
 
-- `/add <url> [url2] ...`: enqueue galleries.
+- `/add <url> [url2] ...`: enqueue galleries or retry failed galleries.
 - `/status`: show pending, ready and failed counts.
 
 `POST /api/queue` accepts JSON and requires `Authorization: Bearer <API_SECRET>`:
@@ -72,7 +72,15 @@ Telegram commands are restricted to `ADMIN_IDS`:
 
 Only E-Hentai and ExHentai gallery URLs are accepted. URLs are normalized to HTTPS without query parameters or fragments before insertion. Concurrent duplicate submissions return HTTP 409. Malformed input returns 400, invalid credentials 401, and internal errors 500.
 
+Submitting a failed gallery again returns success with `Requeued` and reuses its existing database record. Downloaded files are reused when still present; otherwise the gallery is downloaded again. Pending, ready and posted galleries still return HTTP 409 with their current status. A saved VK post ID is always preserved on retry.
+
 The worker selects up to 13 images: up to 4 for the public post and up to 9 for the Donut continuation. It schedules posts at whole UTC hours, with the configured minimum spacing, and checks the five-minute buffer again after uploading photos. The public post ID and image order are saved before the optional Donut operation. Donut failures are logged and do not retry the public post. Local images are removed once processing is complete.
+
+## Recovery after an API outage
+
+An unsuccessful public upload moves the gallery to `FAILED` and retains its files. The uploader continues to the next ready gallery instead of retrying the same old entry every 30 seconds. Failed uploads are paused until explicitly resubmitted; this also applies to network failures after the per-photo retries. A gallery with a saved VK post ID continues to reserve its scheduled time, even if subsequent local processing failed.
+
+After updating the server, rebuild and restart with `docker compose up -d --build`; keep the existing `data` and `downloads` directories. No database migration is required. Check `/status`, fix the API credentials/connectivity if needed, then resubmit the desired failed URLs with `/add` or the extension's VK button. Existing pending/ready entries remain queued and will be attempted; already posted galleries remain protected against duplicate submission.
 
 ## Verification
 

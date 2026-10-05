@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
+from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from config import settings
@@ -40,7 +41,10 @@ async def get_next_available_slot(
 ) -> datetime:
     async with AsyncSessionLocal() as session:
         stmt = select(func.max(Gallery.scheduled_for)).where(
-            Gallery.status.in_([PostStatus.DOWNLOADED, PostStatus.POSTED])
+            or_(
+                Gallery.status.in_([PostStatus.DOWNLOADED, PostStatus.POSTED]),
+                Gallery.vk_post_id.is_not(None),
+            )
         )
         if exclude_gallery_id is not None:
             stmt = stmt.where(Gallery.id != exclude_gallery_id)
@@ -61,8 +65,36 @@ async def queue_gallery(url: str, include_cosplayer: bool = False) -> str:
     url = normalize_gallery_url(url)
     async with AsyncSessionLocal() as session:
         stmt = select(Gallery).where(Gallery.source_url == url)
-        if (await session.execute(stmt)).scalar():
-            raise ServiceError("Gallery already exists")
+        existing = (await session.execute(stmt)).scalar_one_or_none()
+        if existing is not None:
+            if existing.status != PostStatus.FAILED:
+                raise ServiceError(
+                    f"Gallery already exists (status: {existing.status.value})"
+                )
+            # Reuse the row and any saved public post; never reset its VK ID.
+            can_resume = existing.vk_post_id is not None or (
+                bool(existing.local_images)
+                and all(Path(path).is_file() for path in existing.local_images)
+            )
+            values = {
+                "status": PostStatus.DOWNLOADED if can_resume else PostStatus.PENDING,
+            }
+            if existing.vk_post_id is None:
+                values["include_cosplayer"] = include_cosplayer
+                values["scheduled_for"] = datetime.now(timezone.utc)
+            if not can_resume:
+                values["local_images"] = []
+            # Only one concurrent request may reactivate a failed gallery.
+            result = await session.execute(
+                update(Gallery)
+                .where(Gallery.id == existing.id, Gallery.status == PostStatus.FAILED)
+                .values(**values)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            if result.rowcount != 1:
+                raise ServiceError("Gallery already exists (retry already queued)")
+            return "Requeued"
 
         new_gallery = Gallery(
             source_url=url,
@@ -137,4 +169,5 @@ async def get_queue_status() -> str:
         f"Queue Status:\n[PENDING] {counts.get(PostStatus.PENDING, 0)}"
         f"\n[READY TO UPLOAD] {counts.get(PostStatus.DOWNLOADED, 0)}"
         f"\n[FAILED] {counts.get(PostStatus.FAILED, 0)}"
+        "\nTo retry a failed gallery, send /add <url> again."
     )

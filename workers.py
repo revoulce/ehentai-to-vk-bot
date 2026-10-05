@@ -107,6 +107,36 @@ async def publish_gallery(
     logger.success("Scheduled gallery {} in VK", gallery.id)
 
 
+async def upload_next_gallery(publisher: VkPublisher) -> bool:
+    """Attempt one gallery; a failed upload must not monopolize the queue."""
+    async with AsyncSessionLocal() as session:
+        gallery = (
+            await session.execute(
+                select(Gallery)
+                .where(Gallery.status == PostStatus.DOWNLOADED)
+                .order_by(Gallery.scheduled_for, Gallery.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if gallery is None:
+            return False
+        gallery_id = gallery.id
+        try:
+            await publish_gallery(gallery, session, publisher)
+        except Exception:
+            # Reload after rollback so a committed VK ID survives recovery.
+            await session.rollback()
+            await session.refresh(gallery)
+            if gallery.status == PostStatus.DOWNLOADED:
+                gallery.status = PostStatus.FAILED
+                await session.commit()
+            logger.exception(
+                "Upload failed for gallery {}; paused until it is queued again",
+                gallery_id,
+            )
+        return True
+
+
 async def uploader_loop() -> None:
     logger.info("Uploader worker started")
     timeout = aiohttp.ClientTimeout(total=120, connect=10, sock_read=30)
@@ -114,17 +144,7 @@ async def uploader_loop() -> None:
         publisher = VkPublisher(http_session)
         while True:
             try:
-                async with AsyncSessionLocal() as session:
-                    gallery = (
-                        await session.execute(
-                            select(Gallery)
-                            .where(Gallery.status == PostStatus.DOWNLOADED)
-                            .order_by(Gallery.scheduled_for, Gallery.id)
-                            .limit(1)
-                        )
-                    ).scalar_one_or_none()
-                    if gallery is not None:
-                        await publish_gallery(gallery, session, publisher)
+                await upload_next_gallery(publisher)
             except Exception:
                 logger.exception("Uploader failed")
             await asyncio.sleep(30)

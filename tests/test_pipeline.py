@@ -182,6 +182,160 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             slot, last + timedelta(hours=settings.SCHEDULE_INTERVAL_HOURS + 1)
         )
 
+    async def test_concurrent_failed_retries_reuse_one_row(self):
+        gallery_id = await self.add_gallery(
+            status=PostStatus.FAILED, local_images=["missing.jpg"]
+        )
+        results = await asyncio.gather(
+            services.queue_gallery("https://e-hentai.org/g/1/abc/"),
+            services.queue_gallery("http://e-hentai.org/g/1/abc?p=2"),
+            return_exceptions=True,
+        )
+        self.assertEqual(results.count("Requeued"), 1)
+        self.assertEqual(
+            sum(isinstance(result, services.ServiceError) for result in results), 1
+        )
+        async with self.sessions() as session:
+            rows = (await session.execute(select(Gallery))).scalars().all()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].id, gallery_id)
+            self.assertEqual(rows[0].status, PostStatus.PENDING)
+            self.assertEqual(rows[0].local_images, [])
+
+    async def test_api_retries_failed_upload_with_existing_files(self):
+        image = Path(self.directory.name) / "download.jpg"
+        image.write_bytes(b"image")
+        gallery_id = await self.add_gallery(
+            status=PostStatus.FAILED, local_images=[str(image)]
+        )
+        request = MagicMock(
+            json=AsyncMock(
+                return_value={
+                    "url": "https://e-hentai.org/g/1/abc/",
+                    "include_cosplayer": True,
+                }
+            )
+        )
+        response = await api.api_queue_handler(request)
+        self.assertEqual(response.status, 200)
+        self.assertIn("Requeued", response.text)
+        async with self.sessions() as session:
+            gallery = await session.get(Gallery, gallery_id)
+            self.assertEqual(gallery.status, PostStatus.DOWNLOADED)
+            self.assertEqual(gallery.local_images, [str(image)])
+            self.assertTrue(gallery.include_cosplayer)
+        publisher = MagicMock(
+            upload_photos=AsyncMock(return_value=["photo1_1"]),
+            publish=AsyncMock(return_value=42),
+        )
+        with patch.object(workers, "cleanup_files", new_callable=AsyncMock):
+            await workers.upload_next_gallery(publisher)
+        publisher.publish.assert_awaited_once()
+        self.assertGreaterEqual(
+            publisher.publish.call_args.kwargs["publish_date"],
+            int((datetime.now(timezone.utc) + timedelta(minutes=5)).timestamp()),
+        )
+
+    async def test_active_and_posted_galleries_still_conflict(self):
+        for index, status in enumerate(
+            [PostStatus.PENDING, PostStatus.DOWNLOADED, PostStatus.POSTED], start=10
+        ):
+            url = f"https://e-hentai.org/g/{index}/abc/"
+            gallery_id = await self.add_gallery(source_url=url, status=status)
+            with self.subTest(status=status):
+                with self.assertRaisesRegex(services.ServiceError, status.value):
+                    await services.queue_gallery(url)
+                async with self.sessions() as session:
+                    gallery = await session.get(Gallery, gallery_id)
+                    self.assertEqual(gallery.status, status)
+
+    async def test_failed_old_upload_does_not_block_new_gallery(self):
+        old_id = await self.add_gallery(local_images=[])
+        new_id = await self.add_gallery(source_url="https://e-hentai.org/g/2/abc/")
+        publisher = MagicMock(
+            upload_photos=AsyncMock(return_value=["photo1_1"]),
+            publish=AsyncMock(return_value=42),
+        )
+        with (
+            patch.object(workers, "cleanup_files", new_callable=AsyncMock),
+            patch.object(workers, "logger"),
+        ):
+            self.assertTrue(await workers.upload_next_gallery(publisher))
+            self.assertTrue(await workers.upload_next_gallery(publisher))
+            self.assertFalse(await workers.upload_next_gallery(publisher))
+        async with self.sessions() as session:
+            self.assertEqual(
+                (await session.get(Gallery, old_id)).status, PostStatus.FAILED
+            )
+            self.assertEqual(
+                (await session.get(Gallery, new_id)).status, PostStatus.POSTED
+            )
+
+    async def test_public_api_failure_pauses_gallery_and_retains_files(self):
+        gallery_id = await self.add_gallery(local_images=["1.jpg"])
+        publisher = MagicMock(
+            upload_photos=AsyncMock(return_value=["photo1_1"]),
+            publish=AsyncMock(side_effect=VkAPIError(5, "invalid token")),
+        )
+        with (
+            patch.object(workers, "cleanup_files", new_callable=AsyncMock) as cleanup,
+            patch.object(workers, "logger"),
+        ):
+            await workers.upload_next_gallery(publisher)
+            self.assertFalse(await workers.upload_next_gallery(publisher))
+        cleanup.assert_not_awaited()
+        publisher.publish.assert_awaited_once()
+        async with self.sessions() as session:
+            gallery = await session.get(Gallery, gallery_id)
+            self.assertEqual(gallery.status, PostStatus.FAILED)
+            self.assertIsNone(gallery.vk_post_id)
+            self.assertEqual(gallery.local_images, ["1.jpg"])
+
+    async def test_retry_after_local_failure_preserves_saved_public_post(self):
+        gallery_id = await self.add_gallery(local_images=["1.jpg"])
+
+        async def save_public_then_fail(gallery, session, publisher):
+            gallery.vk_post_id = 42
+            await session.commit()
+            gallery.vk_post_id = 99  # Uncommitted state must not survive rollback.
+            raise RuntimeError("local processing failed")
+
+        with (
+            patch.object(workers, "publish_gallery", side_effect=save_public_then_fail),
+            patch.object(workers, "logger"),
+        ):
+            await workers.upload_next_gallery(MagicMock())
+        async with self.sessions() as session:
+            gallery = await session.get(Gallery, gallery_id)
+            self.assertEqual(gallery.status, PostStatus.FAILED)
+            self.assertEqual(gallery.vk_post_id, 42)
+            scheduled_for = gallery.scheduled_for
+        self.assertEqual(
+            await services.queue_gallery("https://e-hentai.org/g/1/abc/", True),
+            "Requeued",
+        )
+        publisher = MagicMock(upload_photos=AsyncMock(), publish=AsyncMock())
+        with patch.object(workers, "cleanup_files", new_callable=AsyncMock):
+            await workers.upload_next_gallery(publisher)
+        publisher.upload_photos.assert_not_awaited()
+        publisher.publish.assert_not_awaited()
+        async with self.sessions() as session:
+            gallery = await session.get(Gallery, gallery_id)
+            self.assertEqual(gallery.status, PostStatus.POSTED)
+            self.assertEqual(gallery.vk_post_id, 42)
+            self.assertEqual(gallery.scheduled_for, scheduled_for)
+            self.assertFalse(gallery.include_cosplayer)
+
+    async def test_failed_gallery_with_saved_vk_post_still_reserves_time(self):
+        last = datetime.now(timezone.utc) + timedelta(days=1)
+        await self.add_gallery(
+            status=PostStatus.FAILED, vk_post_id=42, scheduled_for=last
+        )
+        slot = await services.get_next_available_slot()
+        self.assertGreaterEqual(
+            slot, last + timedelta(hours=settings.SCHEDULE_INTERVAL_HOURS)
+        )
+
     async def test_donut_upload_failure_does_not_repeat_public_post(self):
         gallery_id = await self.add_gallery()
         publisher = MagicMock()
